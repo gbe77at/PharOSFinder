@@ -1,0 +1,110 @@
+import Foundation
+
+// Miroir du JSON renvoyé par le moteur (GET /api/state). Clés snake_case → camelCase.
+
+struct Snapshot: Decodable {
+    var version: String
+    var root: Bool
+    var interfaces: [NetIface]
+    var devices: [Device]
+    var log: [LogEntry]
+    var jobs: [String: Job]
+    var aliases: [IPAlias]
+}
+
+struct IPv4Addr: Decodable, Hashable {
+    var ip: String
+    var mask: String
+    var prefix: Int
+}
+
+struct NetIface: Decodable, Identifiable, Hashable {
+    var name: String
+    var mac: String?
+    var ipv4: [IPv4Addr]
+    var status: String?
+    var label: String
+    var active: Bool
+    var aliases: [String]
+
+    var id: String { name }
+    var summary: String { ipv4.map { "\($0.ip)/\($0.prefix)" }.joined(separator: ", ") }
+    var menuTitle: String {
+        let dot = active ? "●" : "○"
+        let base = label == name ? name : "\(label) (\(name))"
+        return summary.isEmpty ? "\(dot)  \(base)" : "\(dot)  \(base) — \(summary)"
+    }
+}
+
+struct Device: Decodable, Identifiable, Hashable {
+    var id: String
+    var mac: String?
+    var ip: String?
+    var ips: [String]
+    var vendor: String?
+    var kind: String
+    var iface: String?
+    var model: String?
+    var title: String?
+    var server: String?
+    var ports: [Int]
+    var ssh: String?
+    var sources: [String]
+    var tdp: Bool
+    var reachable: Bool?
+    var lastSeen: String?
+    var inRange: Bool
+
+    var displayName: String {
+        if let m = model { return m }
+        if kind == "pharos" { return "PharOS" }
+        if let t = title, !t.isEmpty { return t }
+        return kind == "tplink" ? "TP-Link" : "Équipement"
+    }
+
+    var kindLabel: String {
+        switch kind {
+        case "pharos": return "PharOS"
+        case "tplink": return "TP-Link"
+        default: return "Autre"
+        }
+    }
+
+    var subtitle: String {
+        if let t = title, !t.isEmpty, t != displayName { return t }
+        switch kind {
+        case "pharos": return "Interface PharOS détectée"
+        case "tplink": return "Équipement TP-Link"
+        default: return "Identification partielle"
+        }
+    }
+
+    var isOutOfRange: Bool { ip != nil && !inRange }
+}
+
+struct LogEntry: Decodable, Hashable {
+    var t: String
+    var level: String
+    var msg: String
+}
+
+struct Job: Decodable, Hashable {
+    var label: String
+    var elapsed: Int
+}
+
+struct IPAlias: Decodable, Hashable {
+    var iface: String
+    var ip: String
+    var mask: String
+    var keepReason: String?
+}
+
+func isValidIPv4(_ s: String) -> Bool {
+    let parts = s.trimmingCharacters(in: .whitespaces).split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4 else { return false }
+    return parts.allSatisfy { p in
+        guard !p.isEmpty, p.count <= 3, let v = Int(p) else { return false }
+        return (0...255).contains(v)
+    }
+}
