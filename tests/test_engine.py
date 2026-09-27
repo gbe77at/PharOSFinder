@@ -139,5 +139,18 @@ class SshTests(unittest.TestCase):
             pf.ssh_command("192.168.0.254", "admin; rm -rf /")
 
 
+@unittest.skipUnless(pf.IS_WIN, "Windows seulement")
+class WindowsInterfaceTests(unittest.TestCase):
+    def test_api_matches_powershell(self):
+        api = {i["name"]: i for i in pf._windows_interfaces_api()}
+        ps = {i["name"]: i for i in pf._windows_interfaces_ps()}
+        print("\nAPI:", api, "\nPS:", ps)
+        self.assertTrue(any(i["active"] and i["ipv4"] for i in api.values()))
+        for name, i in ps.items():
+            if name in api:
+                self.assertEqual(api[name]["mac"], i["mac"])
+                self.assertEqual({a["ip"] for a in api[name]["ipv4"]}, {a["ip"] for a in i["ipv4"]})
+
+
 if __name__ == "__main__":
     unittest.main()

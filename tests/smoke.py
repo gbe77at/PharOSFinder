@@ -42,6 +42,9 @@ def main():
         for i in state["interfaces"]:
             print(f"  {i['name']!r} {i['label']!r} actif={i['active']} wifi={i.get('wireless')} {i['ipv4']}")
         active = [i for i in state["interfaces"] if i["active"] and i["ipv4"]]
+        if not active:
+            for line in state["log"]:
+                print(f"  [{line['level']}] {line['msg']}")
         assert active, "aucune interface active avec IPv4 détectée"
         call("/api/scan", {"iface": active[0]["name"], "factory": False})
         for _ in range(240):

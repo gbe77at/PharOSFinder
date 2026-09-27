@@ -277,9 +277,84 @@ WIN_IFACE_PS = (
 )
 
 
+def _windows_interfaces_api():
+    """Interfaces via GetAdaptersAddresses (iphlpapi) : instantané et indépendant de la langue."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SOCKET_ADDRESS(ctypes.Structure):
+        _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
+
+    class UNICAST(ctypes.Structure):
+        pass
+
+    UNICAST._fields_ = [("Length", wintypes.ULONG), ("Flags", wintypes.DWORD),
+                        ("Next", ctypes.POINTER(UNICAST)), ("Address", SOCKET_ADDRESS),
+                        ("PrefixOrigin", ctypes.c_int), ("SuffixOrigin", ctypes.c_int),
+                        ("DadState", ctypes.c_int), ("ValidLifetime", wintypes.ULONG),
+                        ("PreferredLifetime", wintypes.ULONG), ("LeaseLifetime", wintypes.ULONG),
+                        ("OnLinkPrefixLength", ctypes.c_uint8)]
+
+    class ADAPTER(ctypes.Structure):
+        pass
+
+    ADAPTER._fields_ = [("Length", wintypes.ULONG), ("IfIndex", wintypes.DWORD),
+                        ("Next", ctypes.POINTER(ADAPTER)), ("AdapterName", ctypes.c_char_p),
+                        ("FirstUnicastAddress", ctypes.POINTER(UNICAST)),
+                        ("FirstAnycastAddress", ctypes.c_void_p), ("FirstMulticastAddress", ctypes.c_void_p),
+                        ("FirstDnsServerAddress", ctypes.c_void_p), ("DnsSuffix", ctypes.c_wchar_p),
+                        ("Description", ctypes.c_wchar_p), ("FriendlyName", ctypes.c_wchar_p),
+                        ("PhysicalAddress", ctypes.c_ubyte * 8), ("PhysicalAddressLength", wintypes.ULONG),
+                        ("Flags", wintypes.ULONG), ("Mtu", wintypes.ULONG), ("IfType", wintypes.DWORD),
+                        ("OperStatus", ctypes.c_int)]
+
+    gaa = ctypes.windll.iphlpapi.GetAdaptersAddresses
+    size = wintypes.ULONG(32768)
+    for _ in range(4):
+        buf = ctypes.create_string_buffer(size.value)
+        # AF_INET, sans anycast/multicast/DNS ; les cartes débranchées sont incluses.
+        rc = gaa(2, 0x0002 | 0x0004 | 0x0008, None, buf, ctypes.byref(size))
+        if rc != 111:  # ERROR_BUFFER_OVERFLOW : on recommence avec la taille demandée
+            break
+    if rc != 0:
+        raise OSError(f"GetAdaptersAddresses a renvoyé {rc}")
+    res = []
+    node = ctypes.cast(buf, ctypes.POINTER(ADAPTER))
+    while node:
+        a = node.contents
+        node = a.Next
+        if a.IfType in (24, 131) or a.PhysicalAddressLength != 6:  # boucle locale, tunnels
+            continue
+        mac = ":".join(f"{b:02x}" for b in a.PhysicalAddress[:6])
+        ipv4, u = [], a.FirstUnicastAddress
+        while u:
+            ua = u.contents
+            u = ua.Next
+            if not ua.Address.lpSockaddr or ua.DadState == 2:  # doublon
+                continue
+            raw = ctypes.string_at(ua.Address.lpSockaddr, 8)
+            if raw[0] == 2:  # AF_INET
+                ipv4.append(_ipv4_entry(socket.inet_ntoa(raw[4:8]), ua.OnLinkPrefixLength))
+        desc = a.Description or a.FriendlyName
+        wireless = a.IfType == 71 or "wi-fi" in desc.lower() or "wireless" in desc.lower()
+        up = a.OperStatus == 1
+        res.append({"name": a.FriendlyName, "mac": mac, "ipv4": ipv4,
+                    "status": "active" if up else "inactive", "label": desc, "wireless": wireless,
+                    "active": up, "index": a.IfIndex})
+    return res
+
+
 def _windows_interfaces():
+    try:
+        return _windows_interfaces_api()
+    except Exception as e:  # noqa: BLE001
+        log(f"API réseau Windows indisponible ({e}) : repli sur PowerShell", "warn")
+    return _windows_interfaces_ps()
+
+
+def _windows_interfaces_ps():
     r = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-Command", WIN_IFACE_PS], timeout=20, encoding="utf-8")
+             "-Command", WIN_IFACE_PS], timeout=90, encoding="utf-8")
     try:
         data = json.loads((r.stdout or "").strip().lstrip("﻿") or "{}")
     except ValueError:
@@ -308,7 +383,7 @@ def _windows_interfaces():
 # La lecture des interfaces coûte ~1 s sous Windows (PowerShell) : on la met en cache.
 _IFACE_CACHE = {"t": 0.0, "v": None}
 _IFACE_LOCK = threading.Lock()
-IFACE_TTL = 4.0 if IS_WIN else 0.0
+IFACE_TTL = 2.0 if IS_WIN else 0.0
 
 
 def invalidate_interfaces():
