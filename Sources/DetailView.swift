@@ -19,10 +19,12 @@ struct DetailView: View {
                 } label: {
                     Label("Informations", systemImage: "info.circle")
                 }
-                GroupBox {
-                    ipChange.padding(8)
-                } label: {
-                    Label("Changer l'adresse IP", systemImage: "arrow.triangle.2.circlepath")
+                if device.isManageable {
+                    GroupBox {
+                        ipChange.padding(8)
+                    } label: {
+                        Label("Changer l'adresse IP", systemImage: "arrow.triangle.2.circlepath")
+                    }
                 }
             }
             .padding(20)
@@ -32,12 +34,21 @@ struct DetailView: View {
 
     // MARK: En-tête
 
+    private var icon: String {
+        switch device.kind {
+        case "pharos", "tplink": return "antenna.radiowaves.left.and.right"
+        case "tuya": return "lightbulb.fill"
+        case "amazon": return device.model == "Fire TV" ? "tv" : "hifispeaker.fill"
+        default: return "network"
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 13, style: .continuous)
                     .fill(Device.color(for: device.kind).gradient)
-                Image(systemName: device.kind == "other" ? "network" : "antenna.radiowaves.left.and.right")
+                Image(systemName: icon)
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(.white)
             }
@@ -147,6 +158,9 @@ struct DetailView: View {
     private var infoGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
             infoRow("IP", device.ips.isEmpty ? "—" : device.ips.joined(separator: ", "), mono: true)
+            if let n = device.name {
+                infoRow("Nom", n)
+            }
             infoRow("MAC", device.mac ?? "—", mono: true)
             if let v6 = device.ipv6 {
                 infoRow("IPv6", v6, mono: true)
@@ -158,6 +172,13 @@ struct DetailView: View {
             infoRow("Serveur web", device.server ?? "—")
             if let fw = device.firmware {
                 infoRow("Firmware", fw)
+            }
+            if let t = device.tuya {
+                infoRow("ID Tuya", t.gwId ?? "—", mono: true)
+                infoRow("Produit Tuya", "\(t.productKey ?? "—") · v\(t.version ?? "?")", mono: true)
+            }
+            if let sv = device.services, !sv.isEmpty {
+                infoRow("Services", sv.joined(separator: ", "))
             }
             infoRow("Trouvé par", device.sources.joined(separator: ", "))
             if device.tdp {

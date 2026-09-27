@@ -1,5 +1,7 @@
 # Pharos Finder — macOS et Windows
 
+Découverte réseau : **TP-Link PharOS** (CPE510, CPE710…), **Tuya / Smart Life** et **Amazon** (Echo, Fire TV), plus tout appareil annoncé en Bonjour/mDNS.
+
 App native (SwiftUI) pour découvrir les équipements **TP-Link PharOS** (CPE510, CPE710 et les autres CPE/WBS), les rendre joignables et ouvrir leur configuration. Inspirée de Pharos Control et de QNAP Finder.
 
 ## Construire le DMG (une seule fois, ~1 min)
@@ -50,6 +52,15 @@ Les adresses temporaires apparaissent en bas à droite. Elles sont retirées à 
 ## Conseil de branchement
 
 Un Pharos neuf ou réinitialisé est en **192.168.0.254** sans DHCP. Depuis le Wi-Fi, beaucoup de points d'accès bloquent l'accès à cette adresse : relie l'injecteur PoE (port LAN) **directement** à la prise Ethernet du Mac/PC et choisis cette interface.
+
+## Identification
+
+| Type | Comment |
+|---|---|
+| PharOS | annonces CDP/LLDP (IP, modèle, firmware, toutes les 60 s), page web, SSH, fabricant |
+| Tuya / Smart Life | annonces UDP 6666 (v3.1), 6667 (v3.3/3.4, AES-ECB), 7000 (v3.5, AES-GCM) : ID, productKey, version ; fabricant |
+| Amazon | fabricant, puis Fire TV (`_amzn-wplay`, port 5555) ou Echo (ports 55442/55443/4070, Spotify Connect) |
+| Autres | nom Bonjour/mDNS (AirPlay, Chromecast, imprimantes…) |
 
 ## Limites
 

@@ -679,13 +679,21 @@ def _new_device(key, mac, ip):
             "ssh": None, "sources": [], "tdp": False, "pharos_hint": False,
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
-            "announced": None}
+            "announced": None, "name": None, "services": [], "tuya": None}
+
+
+KINDS = ("pharos", "tplink", "tuya", "amazon", "other")   # ordre d'affichage
 
 
 def classify(d):
     text = " ".join(filter(None, [d.get("title"), d.get("model"), d.get("server")])).lower()
+    vendor = (d.get("vendor") or "").lower()
     if d.get("pharos_hint") or "pharos" in text or (d.get("model") and PHAROS_MODEL_RE.match(d["model"])):
         d["kind"] = "pharos"
+    elif d.get("tuya") or "tuya" in vendor:
+        d["kind"] = "tuya"
+    elif "amazon" in vendor or any(sv.startswith("_amzn") for sv in d.get("services") or []):
+        d["kind"] = "amazon"
     elif d.get("vendor") == "TP-Link" or d.get("tplink_hint") or d.get("tdp") or "tp-link" in text:
         d["kind"] = "tplink"
     else:
@@ -698,7 +706,10 @@ def upsert(mac=None, ip=None, source=None, **fields):
     if not mac and not ip:
         return None
     with LOCK:
-        key = mac or f"ip:{ip}"
+        if not mac:  # vu sans MAC (Tuya, mDNS…) : rattache à l'équipement qui a déjà cette IP
+            key = next((k for k, v in DEVICES.items() if v["ip"] == ip), f"ip:{ip}")
+        else:
+            key = mac
         d = DEVICES.get(key)
         if mac and ip and f"ip:{ip}" in DEVICES:  # fusion d'un équipement vu sans MAC
             old = DEVICES.pop(f"ip:{ip}")
@@ -728,6 +739,8 @@ def upsert(mac=None, ip=None, source=None, **fields):
         for k, v in fields.items():
             if k in ("tdp", "pharos_hint", "tplink_hint"):
                 d[k] = d[k] or bool(v)
+            elif k == "services" and v:
+                d[k] = sorted(set(d.get(k) or []) | set(v))
             elif v is not None:
                 d[k] = v
         if mac and not d["vendor"]:
@@ -744,17 +757,21 @@ def fingerprint(dev_id):
             return
         ip4, mac = d["ip"], d["mac"]
         ip = ip4 or d["ipv6"]  # IPv6 link-local quand l'IPv4 est inconnue
-    open_ports = [p for p in (22, 80, 443) if tcp_open(ip, p)]
+    vendor = (vendor_of(mac) or lookup_vendor_online(mac)) if mac else None
+    probe_ports = (22, 80, 443) + (AMAZON_PORTS if vendor and "amazon" in vendor.lower() else ())
+    open_ports = [p for p in probe_ports if tcp_open(ip, p)]
     info = {"ports": open_ports, "reachable": bool(open_ports) or ping(ip, 800), "fingerprinted": True}
+    if vendor and "amazon" in vendor.lower():
+        with LOCK:
+            services = list(DEVICES.get(dev_id, {}).get("services") or [])
+        info["model"] = amazon_model(open_ports, services)
     if 22 in open_ports:
         info["ssh"] = ssh_banner(ip)
     web = http_probe(ip, open_ports) if (80 in open_ports or 443 in open_ports) else None
     if web:
         info.update(web)
-    if mac:
-        v = vendor_of(mac) or lookup_vendor_online(mac)
-        if v:
-            info["vendor"] = v
+    if vendor:
+        info["vendor"] = vendor
     if not ip4 and web:
         info["web_local"] = ensure_tunnel(dev_id, ip, 443 if 443 in open_ports else 80)
     d = upsert(mac=mac, ip=ip4, **info)
@@ -1072,6 +1089,8 @@ def job_scan(iface_name, factory, full, extra):
         log(f"Identification de {len(set(found_ids))} équipement(s)…")
         fingerprint_many(list(dict.fromkeys(found_ids)))
     if not JOBS.get("scan", {}).get("stop"):
+        discover_mdns(iface)
+    if not JOBS.get("scan", {}).get("stop"):
         discover_ipv6(iface)
     log("Recherche terminée.", "ok")
 
@@ -1108,6 +1127,330 @@ def parse_tcpdump_line(line, self_mac=None):
     if ip in ("0.0.0.0", "255.255.255.255"):
         ip = None
     return src, ip, tdp
+
+
+# ─────────────────────────── AES-128 minimal (stdlib seulement) ───────────────────────────
+# Sert uniquement à lire les annonces locales Tuya (clé publique, documentée par tinytuya).
+
+def _aes_tables():
+    sbox, inv = [0] * 256, [0] * 256
+    p = q = 1
+    while True:  # génération classique via le générateur 3 de GF(2^8)
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        x = q ^ ((q << 1) | (q >> 7)) ^ ((q << 2) | (q >> 6)) ^ ((q << 3) | (q >> 5)) ^ ((q << 4) | (q >> 4))
+        x = (x ^ 0x63) & 0xFF
+        sbox[p] = x
+        inv[x] = p
+        if p == 1:
+            break
+    sbox[0], inv[0x63] = 0x63, 0
+    return sbox, inv
+
+
+_SBOX, _INV_SBOX = _aes_tables()
+
+
+def _xt(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+def _mul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a, b = _xt(a), b >> 1
+    return r
+
+
+def _aes_expand(key):
+    w = [list(key[i:i + 4]) for i in range(0, 16, 4)]
+    rcon = 1
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = [_SBOX[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _xt(rcon)
+        w.append([a ^ b for a, b in zip(w[i - 4], t)])
+    return [sum(w[r * 4:r * 4 + 4], []) for r in range(11)]
+
+
+def aes_encrypt_block(rk, block):
+    s = [b ^ k for b, k in zip(block, rk[0])]
+    for r in range(1, 11):
+        s = [_SBOX[b] for b in s]
+        s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]  # ShiftRows
+        if r != 10:
+            m = []
+            for c in range(4):
+                a = s[4 * c:4 * c + 4]
+                m += [_mul(a[0], 2) ^ _mul(a[1], 3) ^ a[2] ^ a[3],
+                      a[0] ^ _mul(a[1], 2) ^ _mul(a[2], 3) ^ a[3],
+                      a[0] ^ a[1] ^ _mul(a[2], 2) ^ _mul(a[3], 3),
+                      _mul(a[0], 3) ^ a[1] ^ a[2] ^ _mul(a[3], 2)]
+            s = m
+        s = [b ^ k for b, k in zip(s, rk[r])]
+    return bytes(s)
+
+
+def aes_decrypt_block(rk, block):
+    s = [b ^ k for b, k in zip(block, rk[10])]
+    for r in range(9, -1, -1):
+        s = [s[(i - 4 * (i % 4)) % 16] for i in range(16)]  # InvShiftRows
+        s = [_INV_SBOX[b] for b in s]
+        s = [b ^ k for b, k in zip(s, rk[r])]
+        if r:
+            m = []
+            for c in range(4):
+                a = s[4 * c:4 * c + 4]
+                m += [_mul(a[0], 14) ^ _mul(a[1], 11) ^ _mul(a[2], 13) ^ _mul(a[3], 9),
+                      _mul(a[0], 9) ^ _mul(a[1], 14) ^ _mul(a[2], 11) ^ _mul(a[3], 13),
+                      _mul(a[0], 13) ^ _mul(a[1], 9) ^ _mul(a[2], 14) ^ _mul(a[3], 11),
+                      _mul(a[0], 11) ^ _mul(a[1], 13) ^ _mul(a[2], 9) ^ _mul(a[3], 14)]
+            s = m
+    return bytes(s)
+
+
+def aes_ecb_decrypt(key, data):
+    rk = _aes_expand(key)
+    out = b"".join(aes_decrypt_block(rk, data[i:i + 16]) for i in range(0, len(data) - len(data) % 16, 16))
+    pad = out[-1] if out else 0
+    return out[:-pad] if 1 <= pad <= 16 and out.endswith(bytes([pad]) * pad) else out
+
+
+def aes_gcm_decrypt_unverified(key, iv, data):
+    """Déchiffrement GCM sans vérifier l'étiquette (lecture d'annonce, pas de sécurité en jeu)."""
+    rk = _aes_expand(key)
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        ctr = iv + (i // 16 + 2).to_bytes(4, "big")
+        ks = aes_encrypt_block(rk, ctr)
+        out += bytes(a ^ b for a, b in zip(data[i:i + 16], ks))
+    return bytes(out)
+
+
+# ─────────────────────────── Tuya / Smart Life ───────────────────────────
+# Les appareils Tuya diffusent leur présence en broadcast (documenté par tinytuya) :
+#   UDP 6666 : protocole 3.1, JSON en clair ; UDP 6667 : 3.3/3.4, AES-128-ECB, clé
+#   md5("yGAdlopoPVldABfn") ; UDP 7000 : 3.5, AES-GCM avec la même clé.
+
+import hashlib  # noqa: E402
+
+TUYA_UDP_KEY = hashlib.md5(b"yGAdlopoPVldABfn").digest()
+TUYA_PORTS = (6666, 6667, 7000)
+
+
+def _json_in(raw):
+    txt = raw.decode("utf-8", "ignore")
+    a, b = txt.find("{"), txt.rfind("}")
+    if a < 0 or b <= a:
+        return None
+    try:
+        return json.loads(txt[a:b + 1])
+    except ValueError:
+        return None
+
+
+def parse_tuya_broadcast(data, port):
+    """Annonce Tuya → dict (ip, gwId, productKey, version…) ou None."""
+    if data[:4] == b"\x00\x00\x55\xaa" and data[-4:] == b"\x00\x00\xaa\x55" and len(data) > 28:
+        body = data[16:-8]  # après préfixe, seq, cmd, longueur
+        if port == 6666:
+            return _json_in(body)
+        for chunk in (body[4:], body):  # le plus souvent précédé d'un code retour de 4 octets
+            if len(chunk) >= 16:
+                obj = _json_in(aes_ecb_decrypt(TUYA_UDP_KEY, chunk[:len(chunk) - len(chunk) % 16]))
+                if obj:
+                    return obj
+        return None
+    if data[:4] == b"\x00\x00\x66\x99" and data[-4:] == b"\x00\x00\x99\x66" and len(data) > 52:
+        # 6699 | 2 octets | seq | cmd | longueur | iv(12) | chiffré | tag(16) | 9966
+        iv, enc = data[18:30], data[30:-20]
+        obj = _json_in(aes_gcm_decrypt_unverified(TUYA_UDP_KEY, iv, enc))
+        if obj is None:
+            obj = {}
+        obj.setdefault("version", "3.5")
+        return obj
+    return None
+
+
+_TUYA_SEEN = set()
+
+
+def handle_tuya(data, sender_ip, port):
+    obj = parse_tuya_broadcast(data, port)
+    if obj is None:
+        return
+    ip = obj.get("ip") or sender_ip
+    try:
+        ipaddress.IPv4Address(ip)
+    except ValueError:
+        ip = sender_ip
+    info = {"gw_id": obj.get("gwId") or obj.get("devId"), "product_key": obj.get("productKey"),
+            "version": str(obj.get("version") or ("3.1" if port == 6666 else "3.3"))}
+    mac = next((e["mac"] for e in arp_table() if e["ip"] == ip), None) if ip not in {k[0] for k in _TUYA_SEEN} else None
+    d = upsert(mac=mac, ip=ip, source="Tuya", tuya=info, model=f"Tuya v{info['version']}",
+               title=f"Smart Life / Tuya · {info['gw_id'] or 'ID inconnu'}")
+    key = (ip, info["gw_id"])
+    if d and key not in _TUYA_SEEN:
+        _TUYA_SEEN.add(key)
+        log(f"Tuya : appareil {info['gw_id'] or '?'} (v{info['version']}"
+            f"{', produit ' + info['product_key'] if info['product_key'] else ''}) en {ip}", "ok")
+
+
+def tuya_listener():
+    """Écoute permanente des annonces Tuya (sans droits admin, Mac/PC/Linux)."""
+    socks = {}
+    for port in TUYA_PORTS:
+        s_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                s_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        try:
+            s_.bind(("", port))
+            socks[s_] = port
+        except OSError as e:
+            log(f"Port Tuya {port} indisponible ({e}) : annonces Tuya de ce port ignorées.", "warn")
+    import select
+    while socks:
+        ready, _, _ = select.select(list(socks), [], [], 2)
+        for s_ in ready:
+            try:
+                data, addr = s_.recvfrom(4096)
+                handle_tuya(data, addr[0], socks[s_])
+            except Exception as e:  # noqa: BLE001
+                log(f"Annonce Tuya illisible : {e}", "warn")
+
+
+# ─────────────────────────── mDNS / Bonjour ───────────────────────────
+
+MDNS_SERVICES = ("_amzn-wplay._tcp", "_amzn-alexa._tcp", "_spotify-connect._tcp", "_googlecast._tcp",
+                 "_airplay._tcp", "_raop._tcp", "_hap._tcp", "_companion-link._tcp", "_http._tcp",
+                 "_ipp._tcp", "_printer._tcp", "_smb._tcp", "_device-info._tcp", "_matter._tcp",
+                 "_sonos._tcp", "_workstation._tcp")
+
+
+def _dns_name(msg, p):
+    labels, jumped, end = [], False, p
+    for _ in range(64):
+        if p >= len(msg):
+            break
+        n = msg[p]
+        if n == 0:
+            p += 1
+            break
+        if n & 0xC0 == 0xC0:
+            if not jumped:
+                end = p + 2
+            p, jumped = ((n & 0x3F) << 8) | msg[p + 1], True
+            continue
+        labels.append(msg[p + 1:p + 1 + n].decode("utf-8", "ignore"))
+        p += 1 + n
+    return ".".join(labels), (end if jumped else p)
+
+
+def mdns_query_packet(services=MDNS_SERVICES):
+    q = b"".join(b"".join(bytes([len(x)]) + x.encode() for x in (sv + ".local").split(".")) + b"\x00"
+                 + struct.pack("!HH", 12, 0x8001) for sv in services)  # PTR, IN + réponse unicast
+    return struct.pack("!HHHHHH", 0, 0, len(services), 0, 0, 0) + q
+
+
+def parse_mdns(msg):
+    """Réponse mDNS → {"hosts": {ip: nom}, "instances": [(service, instance)], "services": set}"""
+    out = {"hosts": {}, "instances": [], "services": set()}
+    if len(msg) < 12:
+        return out
+    qd, an, ns, ar = struct.unpack("!HHHH", msg[4:12])
+    p = 12
+    for _ in range(qd):
+        _, p = _dns_name(msg, p)
+        p += 4
+    for _ in range(an + ns + ar):
+        name, p = _dns_name(msg, p)
+        if p + 10 > len(msg):
+            break
+        rtype, _, _, rdlen = struct.unpack("!HHIH", msg[p:p + 10])
+        rd = p + 10
+        p = rd + rdlen
+        if rtype == 12:  # PTR
+            target, _ = _dns_name(msg, rd)
+            svc = name.replace(".local", "")
+            if svc.startswith("_") and not svc.startswith("_services"):
+                inst = target.split("._")[0]
+                out["instances"].append((svc, inst))
+                out["services"].add(svc)
+        elif rtype == 1 and rdlen == 4:  # A
+            out["hosts"][socket.inet_ntoa(msg[rd:rd + 4])] = name.replace(".local", "")
+    return out
+
+
+def discover_mdns(iface, wait=3.0):
+    """Interroge Bonjour : noms d'appareils (Fire TV, Echo/Spotify, AirPlay, imprimantes…)."""
+    ips = [a["ip"] for a in iface["ipv4"] if not a["ip"].startswith("169.254.")]
+    if not ips:
+        return
+    log(f"Recherche des noms Bonjour/mDNS sur {iface['name']}…")
+    s_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s_.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ips[0]))
+        s_.bind((ips[0], 0))
+        pkt = mdns_query_packet()
+        for _ in range(2):
+            s_.sendto(pkt, ("224.0.0.251", 5353))
+            time.sleep(0.3)
+        s_.settimeout(0.5)
+        found, end = {}, time.time() + wait
+        while time.time() < end:
+            try:
+                data, addr = s_.recvfrom(9000)
+            except socket.timeout:
+                continue
+            r = parse_mdns(data)
+            e = found.setdefault(addr[0], {"names": [], "services": set(), "host": None})
+            e["services"] |= r["services"]
+            e["names"] += [inst for _, inst in r["instances"] if inst not in e["names"]]
+            e["host"] = e["host"] or r["hosts"].get(addr[0])
+    except OSError as e:
+        log(f"mDNS indisponible : {e}", "warn")
+        return
+    finally:
+        s_.close()
+    macs = {e["ip"]: e["mac"] for e in arp_table()}
+    own = all_local_ips()
+    found = {ip: e for ip, e in found.items() if ip not in own}
+    for ip, e in found.items():
+        # « AA11BB22@Salon » (AirPlay audio) → « Salon »
+        names = [n.split("@", 1)[-1] for n in e["names"]]
+        name = next((n for n in names if n), None) or e["host"]
+        d = upsert(mac=macs.get(ip), ip=ip, source="mDNS", name=name, services=sorted(e["services"]))
+        if d and d["kind"] == "amazon" and d.get("fingerprinted"):
+            d["model"] = amazon_model(d["ports"], d["services"])
+    log(f"mDNS : {len(found)} appareil(s) nommé(s).", "ok" if found else "info")
+
+
+# ─────────────────────────── Amazon (Echo, Fire TV…) ───────────────────────────
+
+AMAZON_PORTS = (4070, 5555, 8009, 55442, 55443)
+
+
+def amazon_model(ports, services):
+    services = services or []
+    if any(sv.startswith("_amzn-wplay") for sv in services) or 5555 in ports:
+        return "Fire TV"
+    if 55443 in ports or 55442 in ports or 4070 in ports or "_spotify-connect._tcp" in services \
+            or any(sv.startswith("_amzn-alexa") for sv in services):
+        return "Echo"
+    return "Amazon"
 
 
 # ─────────────── annonces CDP / LLDP (PharOS : CDP toutes les 60 s) ───────────────
@@ -1610,7 +1953,7 @@ def snapshot():
             c["in_range"] = bool(d["ip"]) and not d["ip"].startswith("169.254.") and \
                 any(ipaddress.IPv4Address(d["ip"]) in n for _, n in nets)
             devs.append(c)
-        order = {"pharos": 0, "tplink": 1, "other": 2}
+        order = {k: i for i, k in enumerate(KINDS)}
         devs.sort(key=lambda x: (order[x["kind"]], tuple(int(p) for p in (x["ip"] or "255.255.255.255").split("."))))
         return {
             "version": VERSION, "root": IS_ROOT, "mac_os": IS_MAC, "platform": PLATFORM,
@@ -1805,6 +2148,7 @@ def main():
     atexit.register(stop_sniffers)
     atexit.register(cleanup_vlans)
     threading.Thread(target=announcement_sniffer, daemon=True).start()
+    threading.Thread(target=tuya_listener, daemon=True).start()
 
     def _sig(*_):
         cleanup_aliases()
@@ -1891,7 +2235,7 @@ tr.row{cursor:pointer;background:var(--panel)}
 tr.row:hover{background:var(--panel2)}
 tr.row.sel{background:var(--sel)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--other)}
-.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)}
+.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)} .dot.tuya{background:#f97316} .dot.amazon{background:#6366f1}
 .mono{font-family:var(--mono);font-size:12px}
 .tag{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;margin-right:3px;border:1px solid var(--line);color:var(--muted)}
 .tag.out{color:var(--warn);border-color:currentColor}
@@ -1955,7 +2299,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   <button class="danger" id="btnStop" disabled>Stop</button>
   <div class="spacer"></div>
   <div class="seg" id="filter">
-    <button data-f="pharos">PharOS</button><button data-f="tplink" class="on">TP-Link</button><button data-f="all">Tous</button>
+    <button data-f="all" class="on">Tous</button><button data-f="pharos">PharOS</button><button data-f="tplink">TP-Link</button><button data-f="tuya">Tuya</button><button data-f="amazon">Amazon</button>
   </div>
 </div>
 
@@ -1965,7 +2309,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
       <thead><tr><th>Équipement</th><th>Adresse IP</th><th>MAC</th><th>Fabricant</th><th>Interface</th><th>Services</th><th>Vu</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
-    <div class="empty" id="empty"><b>Aucun équipement pour l'instant</b>Choisis l'interface reliée au Pharos, puis <em>Rechercher</em>.<br>S'il est dans une plage inconnue : <em>Écoute passive</em> et redémarre-le pendant l'écoute.</div>
+    <div class="empty" id="empty"><b>Aucun équipement pour l'instant</b>Choisis l'interface réseau, puis <em>Rechercher</em>. Pharos, TP-Link, Tuya/Smart Life et Amazon sont identifiés.<br>Un Pharos dans une plage inconnue : <em>Écoute passive</em>, il s'annonce en moins d'une minute.</div>
   </div>
   <aside id="detail"><div class="empty" style="padding:40px 0"><b>Sélectionne un équipement</b>pour l'ouvrir, t'y connecter ou changer son IP.</div></aside>
 </main>
@@ -1978,7 +2322,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get('t');
-let S = null, selected = null, filter = 'tplink', ifaceTouched = false, logLen = 0;
+let S = null, selected = null, filter = 'all', ifaceTouched = false, logLen = 0;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -1987,6 +2331,11 @@ async function api(path, body){
   const j = await r.json().catch(()=>({}));
   if(!r.ok){ toast(j.error || 'Erreur'); throw new Error(j.error); }
   refresh(); return j;
+}
+const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
+function displayName(d){
+  if(d.kind === 'pharos') return d.model || 'PharOS';
+  return d.name || d.model || d.title || (d.kind === 'other' ? 'Équipement' : KIND_LABEL[d.kind]);
 }
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none',4500); }
 
@@ -2028,11 +2377,11 @@ function render(){
   $('aliases').innerHTML = S.aliases.map(a => `<span class="alias" title="${esc(a.keep_reason)}">${esc(a.iface)} ${esc(a.ip)}<button data-rm="${esc(a.iface)}|${esc(a.ip)}" title="Retirer l'alias">×</button></span>`).join('');
 
   // rows
-  const list = S.devices.filter(d => filter === 'all' || (filter === 'pharos' ? d.kind === 'pharos' : d.kind !== 'other'));
+  const list = S.devices.filter(d => filter === 'all' || (filter === 'tplink' ? (d.kind === 'tplink' || d.kind === 'pharos') : d.kind === filter));
   $('empty').style.display = list.length ? 'none' : 'block';
   if(!list.length && S.devices.length){ $('empty').innerHTML = `<b>${S.devices.length} équipement(s) masqué(s) par le filtre</b>Clique sur <em>Tous</em> pour les voir.`; }
   $('rows').innerHTML = list.map(d => {
-    const name = d.model || (d.kind === 'pharos' ? 'PharOS' : d.title) || (d.kind === 'tplink' ? 'TP-Link' : 'Équipement');
+    const name = displayName(d);
     const svc = (d.ports||[]).map(p => `<span class="tag">${{22:'SSH',80:'HTTP',443:'HTTPS'}[p]||p}</span>`).join('')
       + (d.tdp ? '<span class="tag tdp">TDP</span>' : '')
       + (d.announced ? `<span class="tag tdp">${esc(d.announced)}</span>` : '')
@@ -2068,18 +2417,22 @@ function renderDetail(){
   if(typing && d) return;
   detailKey = key;
   if(!d){ $('detail').innerHTML = '<div class="empty" style="padding:40px 0"><b>Sélectionne un équipement</b>pour l\'ouvrir, t\'y connecter ou changer son IP.</div>'; return; }
-  const kindLbl = {pharos:'PharOS', tplink:'TP-Link', other:'Équipement'}[d.kind];
+  const kindLbl = KIND_LABEL[d.kind];
   const busy = Object.keys(S.jobs).length > 0;
   const hasWeb = (d.ports||[]).some(p => p === 80 || p === 443);
   const guessNet = d.ip ? d.ip.split('.').slice(0,3).join('.') + '.' : '';
   $('detail').innerHTML = `
-    <h2>${esc(d.model || kindLbl)}</h2>
-    <div class="sub">${esc(d.title || (d.kind === 'pharos' ? 'Interface PharOS détectée' : 'Identification partielle'))}</div>
+    <h2>${esc(displayName(d))}</h2>
+    <div class="sub">${esc((d.model && d.model !== displayName(d) && d.kind !== 'pharos' ? d.model : '') || (d.title !== displayName(d) ? d.title : '') || (d.kind === 'other' ? 'Identification partielle' : kindLbl))}</div>
     <dl>
       <dt>IP</dt><dd class="mono">${esc(d.ips.join(', ') || '—')}</dd>
       <dt>MAC</dt><dd class="mono">${esc(d.mac || '—')}</dd>
       ${d.ipv6 ? `<dt>IPv6</dt><dd class="mono">${esc(d.ipv6)}</dd>` : ''}
+      <dt>Type</dt><dd>${esc(kindLbl)}${d.model && displayName(d) !== d.model ? ' · ' + esc(d.model) : ''}</dd>
+      ${d.name ? `<dt>Nom</dt><dd>${esc(d.name)}</dd>` : ''}
       <dt>Fabricant</dt><dd>${esc(d.vendor || 'inconnu')}</dd>
+      ${d.tuya ? `<dt>ID Tuya</dt><dd class="mono">${esc(d.tuya.gw_id || '—')}</dd><dt>Produit</dt><dd class="mono">${esc(d.tuya.product_key || '—')} · v${esc(d.tuya.version)}</dd>` : ''}
+      ${(d.services||[]).length ? `<dt>Services</dt><dd>${esc(d.services.join(', '))}</dd>` : ''}
       <dt>Interface</dt><dd>${esc(d.iface || '—')}</dd>
       <dt>Joignable</dt><dd>${d.reachable === null ? '<span class="hint">non testé</span>' : d.reachable ? 'oui' : 'non'}${d.ip && !d.in_range ? ' · <span style="color:var(--warn)">hors de tes plages</span>' : ''}</dd>
       <dt>SSH</dt><dd class="mono">${esc(d.ssh || '—')}</dd>
@@ -2095,7 +2448,7 @@ function renderDetail(){
       <button ${d.ip||d.ipv6?'':'disabled'} data-act="ssh">Session SSH…</button>
       <button ${(d.ip||d.ipv6)&&!busy?'':'disabled'} data-act="refresh">Ré-identifier</button>
     </div>
-    <div class="card">
+    ${d.kind === 'pharos' || d.kind === 'tplink' ? `<div class="card">
       <h3>Changer l'adresse IP</h3>
       <ol>
         <li>Ouvre l'interface web et connecte-toi (usine : <span class="mono">admin / admin</span>).</li>
@@ -2105,12 +2458,12 @@ function renderDetail(){
       <div class="row2"><input type="text" id="newIp" placeholder="Nouvelle IP ex. 192.168.3.20" class="mono"><input type="number" id="newPfx" value="24" min="8" max="30" style="flex:none;width:58px" title="Préfixe"></div>
       <button data-act="watch" ${busy?'disabled':''}>Suivre la nouvelle IP</button>
       <p class="hint" style="margin:8px 0 0">Le reste de la configuration (mode, SSID, sécurité…) se fait dans l'interface web PharOS, comme avec Pharos Control.</p>
-    </div>
-    <div class="card">
+    </div>` : ''}
+    ${d.kind === 'pharos' || d.kind === 'tplink' ? `<div class="card">
       <h3>Session SSH</h3>
       <div class="row2"><input type="text" id="sshUser" value="admin" class="mono"></div>
       <p class="hint" style="margin:0">Mêmes identifiants que l'interface web. Algorithmes anciens autorisés pour les vieux firmwares.</p>
-    </div>`;
+    </div>` : ''}`;
 }
 
 document.addEventListener('click', async e => {

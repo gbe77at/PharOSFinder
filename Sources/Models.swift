@@ -61,36 +61,53 @@ struct Device: Decodable, Identifiable, Hashable {
     var firmware: String?
     var announced: String?
     var conflict: Bool?
+    var name: String?
+    var services: [String]?
+    var tuya: TuyaInfo?
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }
     var canOpenWeb: Bool { ip != nil || webLocal != nil }
 
     var displayName: String {
+        if kind == "pharos" { return model ?? "PharOS" }
+        if let n = name, !n.isEmpty { return n }
         if let m = model { return m }
-        if kind == "pharos" { return "PharOS" }
         if let t = title, !t.isEmpty { return t }
-        return kind == "tplink" ? "TP-Link" : "Équipement"
+        return kind == "other" ? "Équipement" : kindLabel
     }
 
     var kindLabel: String {
         switch kind {
         case "pharos": return "PharOS"
         case "tplink": return "TP-Link"
+        case "tuya": return "Tuya / Smart Life"
+        case "amazon": return "Amazon"
         default: return "Autre"
         }
     }
 
     var subtitle: String {
+        if let m = model, m != displayName, kind != "pharos" { return m }
         if let t = title, !t.isEmpty, t != displayName { return t }
         switch kind {
         case "pharos": return "Interface PharOS détectée"
         case "tplink": return "Équipement TP-Link"
+        case "tuya": return "Appareil Tuya / Smart Life"
+        case "amazon": return "Appareil Amazon"
         default: return "Identification partielle"
         }
     }
 
+    var isManageable: Bool { kind == "pharos" || kind == "tplink" }
+
     var isOutOfRange: Bool { ip != nil && !inRange }
+}
+
+struct TuyaInfo: Decodable, Hashable {
+    var gwId: String?
+    var productKey: String?
+    var version: String?
 }
 
 struct LogEntry: Decodable, Hashable {

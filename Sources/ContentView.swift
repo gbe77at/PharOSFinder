@@ -1,16 +1,18 @@
 import SwiftUI
 
 enum DeviceFilter: String, CaseIterable, Identifiable {
+    case all = "Tous"
     case pharos = "PharOS"
     case tplink = "TP-Link"
-    case all = "Tous"
+    case tuya = "Tuya"
+    case amazon = "Amazon"
     var id: String { rawValue }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var engine: Engine
     @State private var selection: Device.ID?
-    @State private var filter: DeviceFilter = .tplink
+    @State private var filter: DeviceFilter = .all
     @State private var search = ""
     @State private var showOptions = false
     @State private var showLog = true
@@ -22,13 +24,15 @@ struct ContentView: View {
             .filter { d in
                 switch filter {
                 case .pharos: return d.kind == "pharos"
-                case .tplink: return d.kind != "other"
+                case .tplink: return d.kind == "tplink" || d.kind == "pharos"
+                case .tuya: return d.kind == "tuya"
+                case .amazon: return d.kind == "amazon"
                 case .all: return true
                 }
             }
             .filter { d in
                 search.isEmpty
-                    || [d.displayName, d.ip ?? "", d.mac ?? "", d.vendor ?? "", d.ips.joined(separator: " ")]
+                    || [d.displayName, d.ip ?? "", d.mac ?? "", d.vendor ?? "", d.model ?? "", d.ips.joined(separator: " ")]
                         .joined(separator: " ").localizedCaseInsensitiveContains(search)
             }
     }
@@ -124,7 +128,7 @@ struct ContentView: View {
                 ForEach(DeviceFilter.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 200)
+            .frame(width: 340)
             .help("Filtrer la liste")
         }
     }
@@ -166,8 +170,8 @@ struct ContentView: View {
                 }
                 .width(min: 130, ideal: 150)
 
-                TableColumn("Fabricant") { d in
-                    Text(d.vendor ?? "—").lineLimit(1)
+                TableColumn("Type") { d in
+                    Text(d.kind == "other" ? (d.vendor ?? "—") : d.kindLabel).lineLimit(1)
                 }
                 .width(min: 80, ideal: 110)
 

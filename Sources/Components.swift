@@ -5,6 +5,8 @@ extension Device {
         switch kind {
         case "pharos": return .blue
         case "tplink": return .teal
+        case "tuya": return .orange
+        case "amazon": return .indigo
         default: return .gray
         }
     }
@@ -39,9 +41,10 @@ struct ServiceBadges: View {
             }
             if device.tdp { Badge(text: "TDP", color: .teal) }
             if let a = device.announced { Badge(text: a, color: .blue) }
+            if let v = device.tuya?.version { Badge(text: "Tuya v\(v)", color: .orange) }
             if device.conflict == true { Badge(text: "conflit IP", color: .red) }
             if device.isOutOfRange { Badge(text: "hors plage", color: .orange) }
-            if device.ports.isEmpty && !device.tdp && !device.isOutOfRange && device.announced == nil {
+            if device.ports.isEmpty && !device.tdp && !device.isOutOfRange && device.announced == nil && device.tuya == nil {
                 Text("—").foregroundStyle(.tertiary)
             }
         }
@@ -77,7 +80,7 @@ struct EmptyStateView: View {
             } else {
                 Text("Aucun équipement pour l'instant")
                     .font(.title3.weight(.semibold))
-                Text("Choisis l'interface reliée au Pharos dans la barre d'outils, puis lance une recherche.\nS'il est dans une plage IP inconnue, lance l'écoute passive et redémarre-le.")
+                Text("Choisis l'interface réseau dans la barre d'outils, puis lance une recherche : Pharos, TP-Link, Tuya/Smart Life et Amazon sont identifiés.\nUn Pharos dans une plage IP inconnue s'annonce tout seul en moins d'une minute.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 460)

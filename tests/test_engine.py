@@ -1,4 +1,5 @@
 """Tests des parseurs du moteur (stdlib seulement) : python3 -m unittest discover tests"""
+import json
 import os
 import socket
 import struct
@@ -200,6 +201,129 @@ class PcapTests(unittest.TestCase):
         head = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
         rec = struct.pack("<IIII", 0, 0, len(CPE510_CDP), len(CPE510_CDP)) + CPE510_CDP
         self.assertEqual(list(pf.iter_pcap(io.BytesIO(head + rec + rec))), [CPE510_CDP, CPE510_CDP])
+
+
+def tuya_frame(body, retcode=True, prefix=b"\x00\x00\x55\xaa", suffix=b"\x00\x00\xaa\x55"):
+    body = (b"\0" * 4 if retcode else b"") + body
+    return prefix + struct.pack("!III", 0, 0x13, len(body) + 8) + body + b"\0" * 4 + suffix
+
+
+def ecb_encrypt(key, data):
+    pad = 16 - len(data) % 16
+    data += bytes([pad]) * pad
+    rk = pf._aes_expand(key)
+    return b"".join(pf.aes_encrypt_block(rk, data[i:i + 16]) for i in range(0, len(data), 16))
+
+
+class AesTests(unittest.TestCase):
+    def test_fips197(self):
+        rk = pf._aes_expand(bytes(range(16)))
+        ct = bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")
+        self.assertEqual(pf.aes_encrypt_block(rk, bytes.fromhex("00112233445566778899aabbccddeeff")), ct)
+        self.assertEqual(pf.aes_decrypt_block(rk, ct), bytes.fromhex("00112233445566778899aabbccddeeff"))
+
+    def test_gcm_ctr_vector(self):  # vecteur 3 de la spécification GCM (McGrew & Viega)
+        key = bytes.fromhex("feffe9928665731c6d6a8f9467308308")
+        iv = bytes.fromhex("cafebabefacedbaddecaf888")
+        ct = bytes.fromhex("42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+                           "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985")
+        pt = bytes.fromhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+                           "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
+        self.assertEqual(pf.aes_gcm_decrypt_unverified(key, iv, ct), pt)
+
+
+class TuyaTests(unittest.TestCase):
+    INFO = {"ip": "10.10.10.47", "gwId": "bf1234567890abcdef", "active": 2, "encrypt": True,
+            "productKey": "keyabc123", "version": "3.3"}
+
+    def test_v31_plain(self):
+        body = json.dumps(dict(self.INFO, version="3.1")).encode()
+        self.assertEqual(pf.parse_tuya_broadcast(tuya_frame(body), 6666)["gwId"], "bf1234567890abcdef")
+
+    def test_v33_encrypted(self):
+        body = ecb_encrypt(pf.TUYA_UDP_KEY, json.dumps(self.INFO).encode())
+        for rc in (True, False):
+            obj = pf.parse_tuya_broadcast(tuya_frame(body, retcode=rc), 6667)
+            self.assertEqual((obj["ip"], obj["productKey"]), ("10.10.10.47", "keyabc123"))
+
+    def test_v35_gcm(self):
+        iv = bytes(range(12))
+        plain = json.dumps(dict(self.INFO, version="3.5")).encode()
+        rk = pf._aes_expand(pf.TUYA_UDP_KEY)
+        enc = bytearray()
+        for i in range(0, len(plain), 16):
+            ks = pf.aes_encrypt_block(rk, iv + (i // 16 + 2).to_bytes(4, "big"))
+            enc += bytes(a ^ b for a, b in zip(plain[i:i + 16], ks))
+        frame = b"\x00\x00\x66\x99" + b"\0\0" + struct.pack("!III", 0, 0x13, 0) + iv + bytes(enc) \
+            + b"\0" * 16 + b"\x00\x00\x99\x66"
+        self.assertEqual(pf.parse_tuya_broadcast(frame, 7000)["version"], "3.5")
+
+    def test_garbage(self):
+        self.assertIsNone(pf.parse_tuya_broadcast(b"hello", 6667))
+
+    def test_handle_creates_tuya_device(self):
+        pf.DEVICES.clear()
+        body = ecb_encrypt(pf.TUYA_UDP_KEY, json.dumps(self.INFO).encode())
+        pf.handle_tuya(tuya_frame(body), "10.10.10.47", 6667)
+        d = next(iter(pf.DEVICES.values()))
+        self.assertEqual((d["kind"], d["ip"], d["tuya"]["gw_id"]), ("tuya", "10.10.10.47", "bf1234567890abcdef"))
+
+    def test_merges_with_known_mac(self):
+        pf.DEVICES.clear()
+        pf.upsert(mac="84:e3:42:e5:e5:c3", ip="10.10.10.47")
+        pf.upsert(ip="10.10.10.47", source="Tuya", tuya={"gw_id": "x"})
+        self.assertEqual(list(pf.DEVICES), ["84:e3:42:e5:e5:c3"])
+
+
+def mdns_response(name, service, ip):
+    def enc(n):
+        return b"".join(bytes([len(x)]) + x.encode() for x in n.split(".")) + b"\0"
+    ptr = enc(service + ".local") + struct.pack("!HHIH", 12, 1, 120, len(enc(name + "." + service + ".local"))) \
+        + enc(name + "." + service + ".local")
+    a = enc("firetv.local") + struct.pack("!HHIH", 1, 0x8001, 120, 4) + socket.inet_aton(ip)
+    return struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 1) + ptr + a
+
+
+class MdnsTests(unittest.TestCase):
+    def test_query_packet(self):
+        pkt = pf.mdns_query_packet(("_amzn-wplay._tcp",))
+        self.assertEqual(struct.unpack("!H", pkt[4:6])[0], 1)
+        self.assertIn(b"\x0b_amzn-wplay\x04_tcp\x05local\x00", pkt)
+
+    def test_parse(self):
+        r = pf.parse_mdns(mdns_response("Fire TV de Guillaume", "_amzn-wplay._tcp", "10.10.10.80"))
+        self.assertEqual(r["instances"], [("_amzn-wplay._tcp", "Fire TV de Guillaume")])
+        self.assertEqual(r["hosts"], {"10.10.10.80": "firetv"})
+
+
+class AmazonTests(unittest.TestCase):
+    def test_models(self):
+        self.assertEqual(pf.amazon_model([], ["_amzn-wplay._tcp"]), "Fire TV")
+        self.assertEqual(pf.amazon_model([55443], []), "Echo")
+        self.assertEqual(pf.amazon_model([4070], []), "Echo")
+        self.assertEqual(pf.amazon_model([], []), "Amazon")
+
+    def test_classify(self):
+        d = pf._new_device("x", "40:a9:cf:63:c1:25", "10.10.10.80")
+        d["vendor"] = "Amazon Technologies Inc."
+        pf.classify(d)
+        self.assertEqual(d["kind"], "amazon")
+        d = pf._new_device("y", "84:e3:42:e5:e5:c3", "10.10.10.47")
+        d["vendor"] = "Tuya Smart Inc."
+        pf.classify(d)
+        self.assertEqual(d["kind"], "tuya")
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_all_kinds_serialize(self):
+        pf.DEVICES.clear()
+        pf.upsert(mac="cc:32:e5:9d:a9:a4", ip="192.168.0.254", model="CPE510")
+        pf.upsert(mac="84:e3:42:e5:e5:c3", ip="10.10.10.47", tuya={"gw_id": "x", "version": "3.3"})
+        pf.upsert(mac="40:a9:cf:63:c1:25", ip="10.10.10.80", vendor="Amazon Technologies Inc.")
+        pf.upsert(mac="02:00:00:00:00:01", ip=None)
+        snap = pf.snapshot()
+        json.dumps(snap)
+        self.assertEqual([d["kind"] for d in snap["devices"]], ["pharos", "tuya", "amazon", "other"])
 
 
 class SshTests(unittest.TestCase):
