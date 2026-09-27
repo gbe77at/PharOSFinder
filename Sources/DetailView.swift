@@ -84,18 +84,26 @@ struct DetailView: View {
     private var actions: some View {
         VStack(spacing: 8) {
             Button { engine.openWeb(device, https: true) } label: {
-                Label("Ouvrir l'interface web", systemImage: "safari")
+                Label(device.ip == nil && device.webLocal != nil ? "Ouvrir l'interface web (via IPv6)" : "Ouvrir l'interface web",
+                      systemImage: "safari")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(device.ip == nil)
+            .disabled(!device.canOpenWeb)
+            if device.ip == nil && device.ipv6 != nil {
+                Text("IPv4 inconnue : Pharos Finder relaie l'interface web par IPv6. Tu y liras son adresse IP dans Network → LAN, sans reset.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack(spacing: 8) {
                 Button { engine.openWeb(device, https: false) } label: {
                     Text("En http").frame(maxWidth: .infinity)
                 }
                 .help("Ouvre http:// (anciens firmwares)")
+                .disabled(device.ip == nil)
                 Button { engine.openSSH(device, user: sshUser) } label: {
                     Label("SSH", systemImage: "terminal").frame(maxWidth: .infinity)
                 }
@@ -106,7 +114,7 @@ struct DetailView: View {
                 .disabled(engine.isBusy)
             }
             .controlSize(.large)
-            .disabled(device.ip == nil)
+            .disabled(device.sshAddress == nil)
 
             HStack {
                 Text("Utilisateur SSH").foregroundStyle(.secondary)
@@ -126,6 +134,9 @@ struct DetailView: View {
         Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
             infoRow("IP", device.ips.isEmpty ? "—" : device.ips.joined(separator: ", "), mono: true)
             infoRow("MAC", device.mac ?? "—", mono: true)
+            if let v6 = device.ipv6 {
+                infoRow("IPv6", v6, mono: true)
+            }
             infoRow("Fabricant", device.vendor ?? "inconnu")
             infoRow("Interface", device.iface ?? "—")
             infoRow("Ports ouverts", device.ports.isEmpty ? "aucun détecté" : device.ports.map { String($0) }.joined(separator: ", "))

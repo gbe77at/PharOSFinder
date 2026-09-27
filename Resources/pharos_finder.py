@@ -636,10 +636,11 @@ def http_probe(ip, open_ports):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                          urllib.request.HTTPSHandler(context=_ssl_ctx()))
     tries = []
+    host = f"[{ip}]" if ":" in ip else ip
     if 443 in open_ports:
-        tries.append(f"https://{ip}/")
+        tries.append(f"https://{host}/")
     if 80 in open_ports:
-        tries.append(f"http://{ip}/")
+        tries.append(f"http://{host}/")
     for url in tries:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 PharosFinder"})
@@ -672,7 +673,7 @@ def _new_device(key, mac, ip):
             "iface": None, "model": None, "title": None, "server": None, "ports": [],
             "ssh": None, "sources": [], "tdp": False, "pharos_hint": False,
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
-            "fingerprinted": False}
+            "fingerprinted": False, "ipv6": None, "web_local": None}
 
 
 def classify(d):
@@ -728,9 +729,10 @@ def upsert(mac=None, ip=None, source=None, **fields):
 def fingerprint(dev_id):
     with LOCK:
         d = DEVICES.get(dev_id)
-        if not d or not d["ip"]:
+        if not d or not (d["ip"] or d.get("ipv6")):
             return
-        ip, mac = d["ip"], d["mac"]
+        ip4, mac = d["ip"], d["mac"]
+        ip = ip4 or d["ipv6"]  # IPv6 link-local quand l'IPv4 est inconnue
     open_ports = [p for p in (22, 80, 443) if tcp_open(ip, p)]
     info = {"ports": open_ports, "reachable": bool(open_ports) or ping(ip, 800), "fingerprinted": True}
     if 22 in open_ports:
@@ -742,7 +744,9 @@ def fingerprint(dev_id):
         v = vendor_of(mac) or lookup_vendor_online(mac)
         if v:
             info["vendor"] = v
-    d = upsert(mac=mac, ip=ip, **info)
+    if not ip4 and web:
+        info["web_local"] = ensure_tunnel(dev_id, ip, 443 if 443 in open_ports else 80)
+    d = upsert(mac=mac, ip=ip4, **info)
     if d:
         label = {"pharos": "PharOS", "tplink": "TP-Link"}.get(d["kind"], "équipement")
         extra = f" — {d['model']}" if d.get("model") else (f" — « {d['title']} »" if d.get("title") else "")
@@ -753,6 +757,114 @@ def fingerprint(dev_id):
 def fingerprint_many(ids):
     with cf.ThreadPoolExecutor(8) as ex:
         list(ex.map(fingerprint, ids))
+
+
+NDP_MAC = re.compile(r"^(fe80:[0-9a-f:]+)(?:%(\S+))?\s+([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})\s+(\S+)", re.I | re.M)
+NETSH_V6 = re.compile(r"(fe80:[0-9a-f:]+)\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})", re.I)
+LINUX_V6 = re.compile(r"^(fe80:[0-9a-f:]+) (?:dev \S+ )?lladdr ([0-9a-f:]{17})", re.I | re.M)
+
+
+def ipv6_neighbors(iface):
+    """Voisins IPv6 link-local du câble : [(fe80::…%scope, mac)]. Indépendant de la plage IPv4."""
+    name = iface["name"]
+    if IS_WIN:
+        scope = str(iface.get("index") or "")
+        if not scope:
+            return []
+        run(["ping", "-n", "2", "-w", "800", f"ff02::1%{scope}"], timeout=10)
+        out = run(["netsh", "interface", "ipv6", "show", "neighbors", f"interface={scope}"]).stdout
+        rows = [(a, m.replace("-", ":")) for a, m in NETSH_V6.findall(out)]
+    elif IS_MAC:
+        scope = name
+        run(["ping6", "-c", "2", "-i", "1", f"ff02::1%{name}"], timeout=10)
+        rows = [(a, m) for a, sc, m, i in NDP_MAC.findall(run(["ndp", "-an"]).stdout) if i == name]
+    else:
+        scope = name
+        run(["ping", "-6", "-c", "2", "-i", "1", f"ff02::1%{name}"], timeout=10)
+        rows = LINUX_V6.findall(run(["ip", "-6", "neigh", "show", "dev", name]).stdout)
+    res = []
+    for addr, mac in rows:
+        mac = norm_mac(mac)
+        if mac and mac != iface["mac"] and not is_multicast_mac(mac):
+            res.append((f"{addr}%{scope}", mac))
+    return res
+
+
+def discover_ipv6(iface):
+    """Trouve un Pharos déjà configuré dans une plage IPv4 inconnue, sans reset ni écoute."""
+    log(f"Recherche IPv6 link-local sur {iface['name']} (trouve un Pharos quelle que soit son IP)…")
+    neigh = ipv6_neighbors(iface)
+    with LOCK:
+        known = {d["mac"] for d in DEVICES.values() if d["ip"] and d["mac"]}
+    ids = []
+    for ll, mac in neigh:
+        if mac in known:
+            continue
+        vendor = vendor_of(mac) or lookup_vendor_online(mac)
+        if vendor not in ("TP-Link", None):
+            continue
+        d = upsert(mac=mac, source="IPv6", iface=iface["name"], ipv6=ll)
+        if d:
+            ids.append(d["id"])
+    log(f"IPv6 : {len(neigh)} voisin(s), {len(ids)} candidat(s) TP-Link/inconnu(s) sans IPv4 connue.",
+        "ok" if ids else "info")
+    if ids:
+        fingerprint_many(ids)
+
+
+TUNNELS = {}   # id équipement -> {"port", "target"}
+
+
+def ensure_tunnel(dev_id, target, port):
+    """Relais local 127.0.0.1:P → [fe80::…%if]:port, pour ouvrir l'interface web d'un Pharos
+    dont on ne connaît que l'adresse IPv6 link-local (les navigateurs refusent les %scope)."""
+    with LOCK:
+        t = TUNNELS.get(dev_id)
+        if t and t["target"] == (target, port):
+            return t["url"]
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    local = srv.getsockname()[1]
+
+    def pump(a, b):
+        try:
+            while True:
+                data = a.recv(65536)
+                if not data:
+                    break
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s_ in (a, b):
+                try:
+                    s_.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                r = socket.create_connection((target, port), timeout=5)
+                r.settimeout(None)
+            except OSError:
+                c.close()
+                continue
+            threading.Thread(target=pump, args=(c, r), daemon=True).start()
+            threading.Thread(target=pump, args=(r, c), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    url = f"{'https' if port == 443 else 'http'}://127.0.0.1:{local}/"
+    with LOCK:
+        TUNNELS[dev_id] = {"target": (target, port), "url": url}
+    log(f"Accès web via IPv6 : {url} → [{target}]:{port}")
+    return url
 
 
 # ─────────────────────────── tâches ───────────────────────────
@@ -870,6 +982,8 @@ def job_scan(iface_name, factory, full, extra):
     if found_ids:
         log(f"Identification de {len(set(found_ids))} équipement(s)…")
         fingerprint_many(list(dict.fromkeys(found_ids)))
+    if not JOBS.get("scan", {}).get("stop"):
+        discover_ipv6(iface)
     log("Recherche terminée.", "ok")
 
 
@@ -1150,7 +1264,8 @@ def open_url(url):
 def ssh_command(ip, user):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", user or ""):
         raise RuntimeError("nom d'utilisateur invalide")
-    ipaddress.IPv4Address(ip)
+    if not re.fullmatch(r"(\d{1,3}(\.\d{1,3}){3})|(fe80:[0-9a-fA-F:]+%[A-Za-z0-9]+)", ip or ""):
+        raise RuntimeError("adresse invalide")
     opts = ["-o", "StrictHostKeyChecking=accept-new",
             "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
             "-o", "HostKeyAlgorithms=+ssh-rsa"]
@@ -1525,7 +1640,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   <input type="text" id="extra" placeholder="Autres plages : 10.0.0.0/24…" style="width:190px">
   <button class="primary" id="btnScan">Rechercher</button>
   <button id="btnListen" title="Capture le trafic du câble (ARP, DHCP, TDP 20002) : trouve un équipement dans n'importe quelle plage">Écoute passive</button>
-  <input type="number" id="secs" value="60" min="10" max="600" style="width:62px" title="Durée d'écoute (s)"> s
+  <input type="number" id="secs" value="180" min="10" max="600" style="width:62px" title="Durée d'écoute (s)"> s
   <button class="danger" id="btnStop" disabled>Stop</button>
   <div class="spacer"></div>
   <div class="seg" id="filter">
@@ -1612,7 +1727,7 @@ function render(){
       + (d.ip && !d.in_range ? '<span class="tag out">hors plage</span>' : '');
     return `<tr class="row ${d.id === selected ? 'sel' : ''}" data-id="${esc(d.id)}">
       <td><span class="dot ${d.kind}"></span>${esc(name)}</td>
-      <td class="mono">${esc(d.ip || '—')}${d.ips.length > 1 ? ` <span class="hint">+${d.ips.length-1}</span>` : ''}</td>
+      <td class="mono">${d.ip ? esc(d.ip) : d.ipv6 ? '<span class="hint">IPv6 seule</span>' : '—'}${d.ips.length > 1 ? ` <span class="hint">+${d.ips.length-1}</span>` : ''}</td>
       <td class="mono">${esc(d.mac || '—')}</td>
       <td>${esc(d.vendor || '—')}</td>
       <td>${esc(d.iface || '—')}</td>
@@ -1650,6 +1765,7 @@ function renderDetail(){
     <dl>
       <dt>IP</dt><dd class="mono">${esc(d.ips.join(', ') || '—')}</dd>
       <dt>MAC</dt><dd class="mono">${esc(d.mac || '—')}</dd>
+      ${d.ipv6 ? `<dt>IPv6</dt><dd class="mono">${esc(d.ipv6)}</dd>` : ''}
       <dt>Fabricant</dt><dd>${esc(d.vendor || 'inconnu')}</dd>
       <dt>Interface</dt><dd>${esc(d.iface || '—')}</dd>
       <dt>Joignable</dt><dd>${d.reachable === null ? '<span class="hint">non testé</span>' : d.reachable ? 'oui' : 'non'}${d.ip && !d.in_range ? ' · <span style="color:var(--warn)">hors de tes plages</span>' : ''}</dd>
@@ -1659,10 +1775,11 @@ function renderDetail(){
     </dl>
     <div class="actions">
       ${d.ip && !d.in_range ? `<button class="primary" data-act="reach" ${busy||!S.root?'disabled':''}>Rendre joignable (alias ${esc(guessNet)}x sur ${esc(d.iface || $('iface').value)})</button>` : ''}
+      ${!d.ip && d.web_local ? `<button class="primary" data-act="weblocal">Ouvrir l'interface web (via IPv6)</button><p class="hint" style="margin:0">IPv4 inconnue : l'app relaie l'interface web par IPv6. Tu y liras son IP dans Network → LAN, sans reset.</p>` : ''}
       <button ${d.ip?'':'disabled'} data-act="web" class="${d.in_range && hasWeb ? 'primary' : ''}">Ouvrir l'interface web (https)</button>
       <button ${d.ip?'':'disabled'} data-act="webhttp">Ouvrir en http</button>
-      <button ${d.ip?'':'disabled'} data-act="ssh">Session SSH…</button>
-      <button ${d.ip&&!busy?'':'disabled'} data-act="refresh">Ré-identifier</button>
+      <button ${d.ip||d.ipv6?'':'disabled'} data-act="ssh">Session SSH…</button>
+      <button ${(d.ip||d.ipv6)&&!busy?'':'disabled'} data-act="refresh">Ré-identifier</button>
     </div>
     <div class="card">
       <h3>Changer l'adresse IP</h3>
@@ -1698,7 +1815,8 @@ document.addEventListener('click', async e => {
     // Ouvert par le navigateur lui-même : jamais par le moteur administrateur.
     if(act === 'web') window.open(`https://${d.ip}/`, '_blank', 'noopener');
     if(act === 'webhttp') window.open(`http://${d.ip}/`, '_blank', 'noopener');
-    if(act === 'ssh') await api('/api/ssh', {ip:d.ip, user:($('sshUser')||{}).value || 'admin'});
+    if(act === 'weblocal') window.open(d.web_local, '_blank', 'noopener');
+    if(act === 'ssh') await api('/api/ssh', {ip:d.ip || d.ipv6, user:($('sshUser')||{}).value || 'admin'});
     if(act === 'refresh') await api('/api/refresh', {id:d.id});
     if(act === 'watch'){
       const ip = $('newIp').value.trim();
@@ -1710,7 +1828,7 @@ document.addEventListener('click', async e => {
 
 $('iface').addEventListener('change', () => { ifaceTouched = true; });
 $('btnScan').onclick = () => api('/api/scan', {iface:$('iface').value, factory:$('factory').checked, full:$('full').checked, extra:$('extra').value}).catch(()=>{});
-$('btnListen').onclick = () => api('/api/listen', {iface:$('iface').value, seconds:+$('secs').value || 60}).catch(()=>{});
+$('btnListen').onclick = () => api('/api/listen', {iface:$('iface').value, seconds:+$('secs').value || 180}).catch(()=>{});
 $('btnStop').onclick = () => api('/api/stop').catch(()=>{});
 $('btnQuit').onclick = async () => {
   if(!confirm('Arrêter Pharos Finder ? Les adresses temporaires seront retirées.')) return;

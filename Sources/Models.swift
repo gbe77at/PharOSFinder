@@ -56,6 +56,12 @@ struct Device: Decodable, Identifiable, Hashable {
     var reachable: Bool?
     var lastSeen: String?
     var inRange: Bool
+    var ipv6: String?
+    var webLocal: String?
+
+    /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
+    var sshAddress: String? { ip ?? ipv6 }
+    var canOpenWeb: Bool { ip != nil || webLocal != nil }
 
     var displayName: String {
         if let m = model { return m }

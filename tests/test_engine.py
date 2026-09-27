@@ -128,6 +128,30 @@ class LanFilterTests(unittest.TestCase):
         self.assertEqual(pf.parse_eth_frame(frame), ("50:c7:bf:01:02:03", None, False))
 
 
+class Ipv6Tests(unittest.TestCase):
+    def test_mac_ndp(self):
+        out = ("Neighbor                        Linklayer Address  Netif Expire    St Flgs Prbs\n"
+               "fe80::52c7:bfff:fe01:203%en11   50:c7:bf:1:2:3     en11 23h59m58s S\n"
+               "fe80::1%en0                     8:bd:43:71:f6:e5   en0  permanent R\n")
+        rows = [(a, m, i) for a, sc, m, i in pf.NDP_MAC.findall(out)]
+        self.assertIn(("fe80::52c7:bfff:fe01:203", "50:c7:bf:1:2:3", "en11"), rows)
+
+    def test_windows_netsh(self):
+        out = "Adresse Internet                              Adresse physique   Type\n" \
+              "--------------------------------------------  -----------------  -----------\n" \
+              "fe80::52c7:bfff:fe01:203                      50-c7-bf-01-02-03  Accessible\n"
+        self.assertEqual(pf.NETSH_V6.findall(out), [("fe80::52c7:bfff:fe01:203", "50-c7-bf-01-02-03")])
+
+    def test_linux_neigh(self):
+        out = "fe80::52c7:bfff:fe01:203 lladdr 50:c7:bf:01:02:03 STALE\n"
+        self.assertEqual(pf.LINUX_V6.findall(out), [("fe80::52c7:bfff:fe01:203", "50:c7:bf:01:02:03")])
+
+    def test_ssh_ipv6(self):
+        self.assertEqual(pf.ssh_command("fe80::1%en11", "admin")[-1], "admin@fe80::1%en11")
+        with self.assertRaises(RuntimeError):
+            pf.ssh_command("fe80::1%en11;ls", "admin")
+
+
 class SshTests(unittest.TestCase):
     def test_command(self):
         cmd = pf.ssh_command("192.168.0.254", "admin")

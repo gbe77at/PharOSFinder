@@ -22,11 +22,12 @@ final class Engine: ObservableObject {
     @Published var factory = true
     @Published var fullSweep = false
     @Published var extraRanges = ""
-    @Published var listenSeconds = 60
+    @Published var listenSeconds = 180
 
     let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("PharosFinder-moteur.log")
 
     private var port = 0
+    private var autoSelectedIface = ""
     private let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
     private var pollTask: Task<Void, Never>?
     private var userProcess: Process?
@@ -146,8 +147,13 @@ final class Engine: ObservableObject {
         if let s = snap {
             snapshot = s
             if status != .running(admin: s.root) { status = .running(admin: s.root) }
-            if selectedIface.isEmpty || !s.interfaces.contains(where: { $0.name == selectedIface }) {
-                selectedIface = Engine.pickDefault(s.interfaces)
+            // Choix automatique tant que l'utilisateur n'a rien choisi : un câble branché après le
+            // lancement (Ethernet) passe devant le Wi-Fi.
+            let best = Engine.pickDefault(s.interfaces)
+            if selectedIface.isEmpty || !s.interfaces.contains(where: { $0.name == selectedIface })
+                || (selectedIface == autoSelectedIface && best != selectedIface) {
+                selectedIface = best
+                autoSelectedIface = best
             }
             return
         }
@@ -226,12 +232,16 @@ final class Engine: ObservableObject {
     }
 
     func openWeb(_ d: Device, https: Bool) {
-        guard let ip = d.ip, let url = URL(string: "\(https ? "https" : "http")://\(ip)/") else { return }
+        // IPv4 inconnue : le moteur relaie l'interface web via IPv6 sur 127.0.0.1.
+        let target = d.ip.map { "\(https ? "https" : "http")://\($0)/" } ?? d.webLocal
+        guard let t = target, let url = URL(string: t) else { return }
         NSWorkspace.shared.open(url)
     }
 
     func openSSH(_ d: Device, user: String) {
-        guard let ip = d.ip else { return }
+        guard let ip = d.sshAddress,
+              ip.range(of: "^([0-9.]+|fe80:[0-9A-Fa-f:]+%[A-Za-z0-9]+)$", options: .regularExpression) != nil
+        else { return }
         let u = user.trimmingCharacters(in: .whitespaces)
         guard !u.isEmpty, u.range(of: "^[A-Za-z0-9._-]{1,32}$", options: .regularExpression) != nil else {
             errorMessage = "Nom d'utilisateur SSH invalide."

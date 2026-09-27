@@ -149,7 +149,11 @@ struct ContentView: View {
 
                 TableColumn("Adresse IP") { d in
                     HStack(spacing: 4) {
-                        Text(d.ip ?? "—").font(.system(.body, design: .monospaced))
+                        if let ip = d.ip {
+                            Text(ip).font(.system(.body, design: .monospaced))
+                        } else {
+                            Text(d.ipv6 != nil ? "IPv6 seule" : "—").foregroundStyle(.secondary)
+                        }
                         if d.ips.count > 1 {
                             Text("+\(d.ips.count - 1)").font(.caption).foregroundStyle(.secondary)
                         }
