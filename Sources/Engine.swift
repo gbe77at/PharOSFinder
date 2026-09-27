@@ -55,7 +55,7 @@ final class Engine: ObservableObject {
             status = .failed("Moteur introuvable dans l'application.")
             return
         }
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
             guard let python = Engine.findPython() else {
                 DispatchQueue.main.async {
                     self.status = .failed("Python 3 introuvable. Installe les Command Line Tools (xcode-select --install) ou Python depuis python.org, puis clique sur Réessayer.")
@@ -67,10 +67,9 @@ final class Engine: ObservableObject {
             let args = [python, script, "--port", String(port), "--token", self.token,
                         "--no-browser", "--parent-pid", String(pid)]
             try? FileManager.default.removeItem(at: self.logURL)
-            let admin = self.launchAsAdmin(args)
             DispatchQueue.main.async {
                 self.port = port
-                if !admin { self.launchAsUser(args) }
+                if !self.launchAsAdmin(args) { self.launchAsUser(args) }
                 self.pollTask = Task.detached { [weak self] in await self?.pollLoop() }
             }
         }
@@ -101,6 +100,8 @@ final class Engine: ObservableObject {
         userProcess = nil
     }
 
+    /// Sur le thread principal (NSAppleScript n'est pas sûr ailleurs). La boîte de mot de passe
+    /// native, au nom de l'app, est modale : bloquer la boucle pendant la saisie est voulu.
     private func launchAsAdmin(_ args: [String]) -> Bool {
         let cmd = args.map(Engine.shellQuote).joined(separator: " ")
             + " > " + Engine.shellQuote(logURL.path) + " 2>&1 &"
@@ -300,7 +301,7 @@ final class Engine: ObservableObject {
     }
 
     static func pickDefault(_ ifaces: [NetIface]) -> String {
-        if let wired = ifaces.first(where: { $0.active && !$0.label.lowercased().contains("wi-fi") && !$0.ipv4.isEmpty }) {
+        if let wired = ifaces.first(where: { $0.active && !$0.isWireless && !$0.ipv4.isEmpty }) {
             return wired.name
         }
         return (ifaces.first(where: { $0.active }) ?? ifaces.first)?.name ?? ""

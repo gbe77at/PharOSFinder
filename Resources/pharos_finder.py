@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Pharos Finder — découverte et accès aux équipements TP-Link PharOS (CPE / WBS) sur macOS.
+Pharos Finder — découverte et accès aux équipements TP-Link PharOS (CPE510, CPE710…)
+sur macOS, Windows et Linux.
 
 Inspiré de Pharos Control (TP-Link) et QNAP Finder :
   • balayage ARP des réseaux de chaque interface active ;
   • sondage des plages d'usine PharOS (192.168.0.254 par défaut) via un alias IP temporaire ;
-  • écoute passive du câble (tcpdump) : ARP, DHCP et trafic TDP (UDP 20002, le port de
-    découverte utilisé par Pharos Control) — trouve un équipement même s'il est dans une
-    plage IP inconnue ;
+  • écoute passive du câble (tcpdump sur macOS/Linux, socket brute sur Windows) : ARP, DHCP
+    et trafic TDP (UDP 20002, le port de découverte utilisé par Pharos Control) — trouve un
+    équipement même s'il est dans une plage IP inconnue ;
   • identification : préfixe MAC TP-Link, page web (titre / « PharOS » / modèle CPE-WBS),
     bannière SSH (port 22, canal de gestion Pharos Control) ;
   • accès : alias automatique pour rendre l'équipement joignable, ouverture de l'interface
-    web, session SSH dans Terminal, assistant de changement d'IP avec suivi de la nouvelle
-    adresse.
+    web, session SSH, assistant de changement d'IP avec suivi de la nouvelle adresse.
 
-Python 3.8+ standard, aucune dépendance. Lancer avec sudo (alias IP et tcpdump).
+Python 3.8+ standard, aucune dépendance. Lancer en administrateur (sudo sur macOS/Linux,
+« Exécuter en tant qu'administrateur » sur Windows) pour les alias IP et l'écoute.
 Les alias ajoutés sont retirés automatiquement à la fermeture.
 """
 
@@ -34,19 +35,38 @@ import subprocess
 import sys
 import threading
 import time
+import struct
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 VERSION = "1.0"
 IS_MAC = platform.system() == "Darwin"
-IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+IS_WIN = os.name == "nt"
+IS_LINUX = platform.system() == "Linux"
+PLATFORM = "macos" if IS_MAC else "windows" if IS_WIN else "linux"
+
+
+def _is_admin():
+    if IS_WIN:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+IS_ROOT = _is_admin()
 SUDO_USER = os.environ.get("SUDO_USER")
+# Pas de fenêtre console qui clignote pour chaque ping/arp lancé depuis l'exe Windows.
+NO_WINDOW = 0x08000000 if IS_WIN else 0
 
 PHAROS_DEFAULT_IP = "192.168.0.254"
 FACTORY_NETS = ["192.168.0.0/24", "192.168.1.0/24"]
 PRIORITY_HOSTS = [254, 1, 253, 2, 100, 250]
-PHAROS_MODEL_RE = re.compile(r"\b((?:CPE|WBS)\d{3}[A-Z]?)\b")
+# Modèles visés en priorité : CPE510 et CPE710 (le motif couvre aussi CPE210/610, WBS510…).
+PHAROS_MODEL_RE = re.compile(r"\b((?:CPE|WBS)\d{3}[A-Z]?)\b", re.I)
 
 # Préfixes OUI TP-Link courants (liste non exhaustive ; les autres sont résolus en ligne
 # via api.macvendors.com quand Internet est disponible).
@@ -85,9 +105,10 @@ def log(msg, level="info"):
     print(f"[{entry['t']}] {level.upper():5} {msg}", flush=True)
 
 
-def run(cmd, timeout=15):
+def run(cmd, timeout=15, encoding=None):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              encoding=encoding, errors="replace", creationflags=NO_WINDOW)
     except FileNotFoundError:
         return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]} introuvable")
     except subprocess.TimeoutExpired:
@@ -159,7 +180,7 @@ _HW_CACHE = {"t": 0.0, "v": {}}
 
 
 def hardware_ports():
-    """Associe device -> nom lisible (« USB 10/100/1000 LAN », « Wi-Fi »…). Cache 30 s."""
+    """macOS : device -> nom lisible (« USB 10/100/1000 LAN », « Wi-Fi »…). Cache 30 s."""
     if not IS_MAC:
         return {}
     if time.time() - _HW_CACHE["t"] < 30:
@@ -202,18 +223,111 @@ def parse_ifconfig(text):
     return ifaces
 
 
-def list_interfaces():
+def _ipv4_entry(ip, prefix):
+    prefix = int(prefix)
+    return {"ip": ip, "mask": str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask), "prefix": prefix}
+
+
+def _mac_interfaces():
     ports = hardware_ports()
     res = []
     for i in parse_ifconfig(run(["ifconfig"]).stdout):
         if i["name"].startswith(SKIP_IFACE_PREFIXES) or not i["mac"]:
             continue
         i["label"] = ports.get(i["name"], i["name"])
+        i["wireless"] = i["label"] == "Wi-Fi"
         i["active"] = (i["status"] == "active") if i["status"] is not None else bool(i["ipv4"])
+        res.append(i)
+    return res
+
+
+LINUX_SKIP = SKIP_IFACE_PREFIXES + ("br-", "virbr", "tun", "tap", "wg", "tailscale", "zt", "cni", "flannel")
+
+
+def _linux_interfaces():
+    try:
+        data = json.loads(run(["ip", "-j", "addr", "show"]).stdout or "[]")
+    except ValueError:
+        data = []
+    res = []
+    for d in data:
+        name = d.get("ifname", "")
+        mac = norm_mac(d.get("address") or "")
+        if not mac or name.startswith(LINUX_SKIP) or d.get("link_type") not in (None, "ether"):
+            continue
+        wireless = os.path.exists(f"/sys/class/net/{name}/wireless")
+        ipv4 = [_ipv4_entry(a["local"], a["prefixlen"]) for a in d.get("addr_info", [])
+                if a.get("family") == "inet" and a.get("local")]
+        flags = d.get("flags", [])
+        up = "LOWER_UP" in flags or d.get("operstate") == "UP"
+        res.append({"name": name, "mac": mac, "ipv4": ipv4, "status": "active" if up else "inactive",
+                    "label": ("Wi-Fi" if wireless else "Ethernet") + f" ({name})", "wireless": wireless,
+                    "active": up})
+    return res
+
+
+WIN_IFACE_PS = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    "$a=@(Get-NetAdapter | Select-Object Name,InterfaceDescription,ifIndex,Status,MacAddress,"
+    "@{n='Media';e={[string]$_.PhysicalMediaType}},@{n='St';e={[string]$_.Status}});"
+    "$i=@(Get-NetIPAddress -AddressFamily IPv4 | Select-Object InterfaceIndex,IPAddress,PrefixLength,"
+    "@{n='State';e={[string]$_.AddressState}});"
+    "ConvertTo-Json -Compress -Depth 3 -InputObject @{a=$a;i=$i}"
+)
+
+
+def _windows_interfaces():
+    r = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", WIN_IFACE_PS], timeout=20, encoding="utf-8")
+    try:
+        data = json.loads((r.stdout or "").strip().lstrip("﻿") or "{}")
+    except ValueError:
+        log(f"Lecture des interfaces Windows impossible : {r.stderr.strip()[:200]}", "error")
+        return []
+    ips = {}
+    for a in data.get("i") or []:
+        if str(a.get("State")) in ("Duplicate", "Invalid", "0", "2"):
+            continue
+        ips.setdefault(a.get("InterfaceIndex"), []).append(_ipv4_entry(a["IPAddress"], a["PrefixLength"]))
+    res = []
+    for a in data.get("a") or []:
+        mac = norm_mac((a.get("MacAddress") or "").replace("-", ":"))
+        if not mac:
+            continue
+        media = (a.get("Media") or "").lower()
+        desc = a.get("InterfaceDescription") or a["Name"]
+        wireless = "802.11" in media or "wireless" in desc.lower() or "wi-fi" in desc.lower()
+        up = (a.get("St") or "") == "Up"
+        res.append({"name": a["Name"], "mac": mac, "ipv4": ips.get(a.get("ifIndex"), []),
+                    "status": "active" if up else "inactive", "label": desc, "wireless": wireless,
+                    "active": up, "index": a.get("ifIndex")})
+    return res
+
+
+# La lecture des interfaces coûte ~1 s sous Windows (PowerShell) : on la met en cache.
+_IFACE_CACHE = {"t": 0.0, "v": None}
+_IFACE_LOCK = threading.Lock()
+IFACE_TTL = 4.0 if IS_WIN else 0.0
+
+
+def invalidate_interfaces():
+    _IFACE_CACHE["t"] = 0.0
+
+
+def list_interfaces():
+    with _IFACE_LOCK:
+        if _IFACE_CACHE["v"] is None or time.time() - _IFACE_CACHE["t"] >= IFACE_TTL:
+            raw = _windows_interfaces() if IS_WIN else _linux_interfaces() if IS_LINUX else _mac_interfaces()
+            _IFACE_CACHE.update(t=time.time(), v=raw)
+        raw = _IFACE_CACHE["v"]
+    res = []
+    for i in raw:
+        i = dict(i)
         with LOCK:
             i["aliases"] = [a["ip"] for a in ALIASES if a["iface"] == i["name"]]
         res.append(i)
-    res.sort(key=lambda x: (not x["active"], not x["ipv4"], x["name"]))
+    res.sort(key=lambda x: (not x["active"], not x["ipv4"], x.get("wireless", False), x["name"]))
     return res
 
 
@@ -240,17 +354,47 @@ def all_local_ips():
 
 # ─────────────────────────── alias IP ───────────────────────────
 
+WIN_COEXIST = set()   # interfaces où l'on a activé la coexistence DHCP/statique
+
+
+def _prefix_of(mask):
+    return ipaddress.IPv4Network("0.0.0.0/" + mask).prefixlen
+
+
+def _win_add_address(iface, ip, mask):
+    cmd = ["netsh", "interface", "ipv4", "add", "address", f"name={iface}", f"address={ip}",
+           f"mask={mask}", "store=active"]
+    r = run(cmd)
+    if r.returncode == 0:
+        return r
+    # Interface en DHCP (ou en 169.254 sans serveur DHCP) : Windows 10 2004+ accepte une
+    # adresse statique en plus si la coexistence DHCP/statique est activée.
+    en = run(["netsh", "interface", "ipv4", "set", "interface", f"interface={iface}",
+              "dhcpstaticipcoexistence=enabled"])
+    if en.returncode == 0:
+        WIN_COEXIST.add(iface)
+        r = run(cmd)
+    return r
+
+
 def add_alias(iface, ip, mask, reason=""):
     if not IS_ROOT:
-        raise RuntimeError("droits admin requis pour ajouter un alias (relancer avec sudo)")
-    r = run(["ifconfig", iface, "alias", ip, mask]) if IS_MAC else \
-        run(["ip", "addr", "add", f"{ip}/{ipaddress.IPv4Network('0.0.0.0/' + mask).prefixlen}", "dev", iface])
+        raise RuntimeError("droits administrateur requis pour ajouter une adresse temporaire")
+    if IS_MAC:
+        r = run(["ifconfig", iface, "alias", ip, mask])
+    elif IS_WIN:
+        r = _win_add_address(iface, ip, mask)
+    else:
+        r = run(["ip", "addr", "add", f"{ip}/{_prefix_of(mask)}", "dev", iface])
     if r.returncode != 0:
-        raise RuntimeError(f"alias {ip} sur {iface} refusé : {r.stderr.strip()}")
+        msg = (r.stderr.strip() or r.stdout.strip())[:300]
+        raise RuntimeError(f"alias {ip} sur {iface} refusé : {msg}")
     with LOCK:
         ALIASES.append({"iface": iface, "ip": ip, "mask": mask, "keep_reason": reason})
+    invalidate_interfaces()
     log(f"Alias temporaire {ip}/{mask} ajouté sur {iface}")
-    time.sleep(0.8)
+    # Windows fait une détection de doublon (DAD) avant d'utiliser l'adresse.
+    time.sleep(2.5 if IS_WIN else 0.8)
 
 
 def remove_alias(iface, ip):
@@ -258,11 +402,19 @@ def remove_alias(iface, ip):
         entry = next((a for a in ALIASES if a["iface"] == iface and a["ip"] == ip), None)
         if entry:
             ALIASES.remove(entry)
+        still = any(a["iface"] == iface for a in ALIASES)
     if IS_MAC:
         run(["ifconfig", iface, "-alias", ip])
+    elif IS_WIN:
+        run(["netsh", "interface", "ipv4", "delete", "address", f"name={iface}", f"address={ip}"])
+        if iface in WIN_COEXIST and not still:
+            run(["netsh", "interface", "ipv4", "set", "interface", f"interface={iface}",
+                 "dhcpstaticipcoexistence=disabled"])
+            WIN_COEXIST.discard(iface)
     else:
         mask = entry["mask"] if entry else "255.255.255.0"
-        run(["ip", "addr", "del", f"{ip}/{ipaddress.IPv4Network('0.0.0.0/' + mask).prefixlen}", "dev", iface])
+        run(["ip", "addr", "del", f"{ip}/{_prefix_of(mask)}", "dev", iface])
+    invalidate_interfaces()
     log(f"Alias {ip} retiré de {iface}")
 
 
@@ -304,36 +456,71 @@ def ensure_reachable(ip, iface, prefix=24):
 # ─────────────────────────── sondes réseau ───────────────────────────
 
 def ping(ip, timeout_ms=500):
-    cmd = ["ping", "-c", "1"]
+    if IS_WIN:
+        # Windows renvoie 0 même pour « Impossible de joindre l'hôte » : on cherche « TTL= ».
+        r = run(["ping", "-n", "1", "-w", str(timeout_ms), str(ip)], timeout=4)
+        return "ttl=" in (r.stdout or "").lower()
+    cmd = ["ping", "-c", "1", "-n"]
     cmd += ["-W", str(timeout_ms)] if IS_MAC else ["-W", "1"]
     cmd.append(str(ip))
     try:
         return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               timeout=3).returncode == 0
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
-def sweep(hosts, workers=64):
+def probe_host(ip):
+    ip = str(ip)
+    return ping(ip, 1000) or tcp_open(ip, 443, 1.0) or tcp_open(ip, 80, 1.0) or tcp_open(ip, 22, 1.0)
+
+
+def sweep(hosts, workers=64, probe=ping):
     alive = []
     with cf.ThreadPoolExecutor(workers) as ex:
-        for ip, ok in zip(hosts, ex.map(ping, hosts)):
+        for ip, ok in zip(hosts, ex.map(probe, hosts)):
             if ok:
                 alive.append(str(ip))
     return alive
 
 
 ARP_RE = re.compile(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{11,17})(?: \[\w+\])? on (\S+)")
+WIN_ARP_IF = re.compile(r"^\S.*?(\d+\.\d+\.\d+\.\d+)\s+-+\s+0x([0-9a-fA-F]+)")
+WIN_ARP_ROW = re.compile(r"^\s+(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s")
+LINUX_NEIGH = re.compile(r"^(\d+\.\d+\.\d+\.\d+) dev (\S+) lladdr ([0-9a-fA-F:]{17})")
+
+
+def parse_arp_windows(text, index_to_name):
+    entries, iface = [], None
+    for line in text.splitlines():
+        m = WIN_ARP_IF.match(line)
+        if m:
+            iface = index_to_name.get(int(m.group(2), 16), m.group(1))
+            continue
+        m = WIN_ARP_ROW.match(line)
+        if m and iface:
+            entries.append((m.group(1), m.group(2).replace("-", ":"), iface))
+    return entries
 
 
 def arp_table():
-    out = run(["arp", "-an"]).stdout
+    if IS_MAC:
+        raw = [(m.group(1), m.group(2), m.group(3)) for m in ARP_RE.finditer(run(["arp", "-an"]).stdout)]
+    elif IS_WIN:
+        idx = {i.get("index"): i["name"] for i in list_interfaces()}
+        raw = parse_arp_windows(run(["arp", "-a"]).stdout, idx)
+    else:
+        raw = []
+        for line in run(["ip", "-4", "neigh", "show"]).stdout.splitlines():
+            m = LINUX_NEIGH.match(line)
+            if m and "FAILED" not in line and "INCOMPLETE" not in line:
+                raw.append((m.group(1), m.group(3), m.group(2)))
     entries = []
-    for m in ARP_RE.finditer(out):
-        mac = norm_mac(m.group(2))
+    for ip, mac, iface in raw:
+        mac = norm_mac(mac)
         if not mac or mac == "ff:ff:ff:ff:ff:ff" or is_multicast_mac(mac):
             continue
-        entries.append({"ip": m.group(1), "mac": mac, "iface": m.group(3)})
+        entries.append({"ip": ip, "mac": mac, "iface": iface})
     return entries
 
 
@@ -390,14 +577,15 @@ def http_probe(ip, open_ports):
         t = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
         title = re.sub(r"\s+", " ", t.group(1)).strip()[:120] if t else None
         low = body.lower()
-        model = PHAROS_MODEL_RE.search(body)
+        # Le titre d'abord (« CPE510 », « CPE710 »…), puis le reste de la page.
+        model = PHAROS_MODEL_RE.search(title or "") or PHAROS_MODEL_RE.search(body)
         return {
             "web": final or url,
             "title": title,
             "server": server,
             "pharos_hint": "pharos" in low,
             "tplink_hint": "tp-link" in low or "tplink" in low or "tp_link" in low,
-            "model": model.group(1) if model else None,
+            "model": model.group(1).upper() if model else None,
         }
     return None
 
@@ -518,6 +706,10 @@ def job_scan(iface_name, factory, full, extra):
         raise RuntimeError(f"interface {iface_name} introuvable")
     if not iface["active"]:
         log(f"{iface_name} ({iface['label']}) n'a pas de lien actif — câble branché ?", "warn")
+    if iface.get("wireless") and factory:
+        log(f"{iface_name} est une interface Wi-Fi : beaucoup de points d'accès bloquent l'accès à "
+            "un Pharos resté sur son IP d'usine (192.168.0.254). Si rien n'est trouvé, relie le "
+            "Pharos (injecteur PoE) en Ethernet au Mac, choisis cette interface, puis relance.", "warn")
     local_ips = {a["ip"] for a in iface["ipv4"]}
     plans = []
     for n in iface_networks(iface):
@@ -548,10 +740,13 @@ def job_scan(iface_name, factory, full, extra):
 
     found_ids = []
     for net, needs_alias in plans:
+        if JOBS.get("scan", {}).get("stop"):
+            log("Recherche interrompue.", "warn")
+            break
         alias = None
         if needs_alias:
             if not IS_ROOT:
-                log(f"Plage {net} sautée : alias impossible sans sudo", "warn")
+                log(f"Plage {net} sautée : adresse temporaire impossible sans droits admin", "warn")
                 continue
             alias = pick_alias_ip(net)
             add_alias(iface_name, alias, str(net.netmask), reason=f"sondage {net}")
@@ -563,7 +758,17 @@ def job_scan(iface_name, factory, full, extra):
             log(f"Sondage rapide de {net} (.{', .'.join(str(h) for h in PRIORITY_HOSTS)}) depuis {alias}")
         else:
             log(f"Balayage de {net} ({len(hosts)} adresses) sur {iface_name}…")
-        alive = set(sweep([h for h in hosts if str(h) not in local_ips and str(h) != alias]))
+        targets = [h for h in hosts if str(h) not in local_ips and str(h) != alias]
+        if needs_alias and not full:
+            # Peu d'adresses : sonde plus patiente (ping 1 s + HTTPS/HTTP), deux passes, car le
+            # premier ARP via une adresse toute neuve (Wi-Fi surtout) est souvent perdu.
+            alive = set()
+            for _ in range(2):
+                alive |= set(sweep([h for h in targets if str(h) not in alive], probe=probe_host))
+                if alive:
+                    break
+        else:
+            alive = set(sweep(targets))
         # L'ARP se résout même si l'équipement filtre l'ICMP : on lit la table.
         hits = 0
         for e in arp_table():
@@ -627,57 +832,187 @@ def parse_tcpdump_line(line, self_mac=None):
     return src, ip, tdp
 
 
-def job_listen(iface_name, seconds):
-    if not IS_ROOT:
-        raise RuntimeError("l'écoute passive nécessite sudo")
-    iface = get_iface(iface_name)
-    if not iface:
-        raise RuntimeError(f"interface {iface_name} introuvable")
-    cmd = ["tcpdump", "-i", iface_name, "-n", "-e", "-l"]
+TDP_PORTS = {20001, 20002}
+
+
+def is_lan_ip(ip):
+    a = ipaddress.IPv4Address(ip)
+    return (a.is_private or a.is_link_local) and not a.is_multicast
+
+
+def parse_ipv4_packet(pkt, src_mac=None):
+    """Paquet IPv4 brut → (mac|None, ip|None, tdp). Lit l'adresse MAC dans les requêtes DHCP."""
+    if len(pkt) < 20 or pkt[0] >> 4 != 4:
+        return None
+    ihl = (pkt[0] & 0x0F) * 4
+    src = socket.inet_ntoa(pkt[12:16])
+    mac, tdp = src_mac, False
+    if pkt[9] == 17 and len(pkt) >= ihl + 8:
+        sport, dport = struct.unpack("!HH", pkt[ihl:ihl + 4])
+        tdp = bool({sport, dport} & TDP_PORTS)
+        bootp = pkt[ihl + 8:]
+        if {sport, dport} & {67, 68} and len(bootp) >= 34 and bootp[0] == 1:
+            mac = ":".join(f"{b:02x}" for b in bootp[28:34])
+    ip = None if src in ("0.0.0.0", "255.255.255.255") else src
+    if not mac and not ip:
+        return None
+    return mac, ip, tdp
+
+
+def parse_eth_frame(frame):
+    """Trame Ethernet brute → (mac, ip|None, tdp) pour ARP et IPv4."""
+    if len(frame) < 14:
+        return None
+    src = ":".join(f"{b:02x}" for b in frame[6:12])
+    etype, off = struct.unpack("!H", frame[12:14])[0], 14
+    if etype == 0x8100 and len(frame) >= 18:  # VLAN
+        etype, off = struct.unpack("!H", frame[16:18])[0], 18
+    if is_multicast_mac(src):
+        return None
+    if etype == 0x0806 and len(frame) >= off + 28:
+        ip = socket.inet_ntoa(frame[off + 14:off + 18])
+        return src, (None if ip == "0.0.0.0" else ip), False
+    if etype == 0x0800:
+        p = parse_ipv4_packet(frame[off:], src)
+        return (src,) + p[1:] if p else (src, None, False)
+    # IPv6 (ND/MLD), LLDP… : un Pharos qui démarre s'annonce souvent ainsi avant tout ARP.
+    return src, None, False
+
+
+def _listen_tcpdump(iface, stop):
+    cmd = ["tcpdump", "-i", iface["name"], "-n", "-e", "-l"]
     if iface["mac"]:
         cmd += ["not", "ether", "src", iface["mac"]]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
     with LOCK:
         JOBS["listen"]["proc"] = proc
-    log(f"Écoute passive sur {iface_name} pendant {seconds} s — débranche/rebranche l'alimentation "
-        "du Pharos maintenant pour capter ses annonces.", "ok")
-    seen, count = {}, [0]
 
-    def reader():
+    def _watchdog():  # readline() bloque tant qu'aucune trame n'arrive
+        while proc.poll() is None and not stop():
+            time.sleep(0.3)
+        if proc.poll() is None:
+            proc.terminate()
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+    try:
         for line in proc.stdout:
-            count[0] += 1
-            p = parse_tcpdump_line(line, iface["mac"])
-            if not p:
-                continue
-            mac, ip, tdp = p
-            first = (mac, ip) not in seen
-            seen[(mac, ip)] = True
-            d = upsert(mac=mac, ip=ip, source="écoute", iface=iface_name, tdp=tdp or None)
-            if first:
-                note = " · trafic TDP (port 20002)" if tdp else ""
-                log(f"Vu {mac} ({d['vendor'] or 'fabricant ?'}) → {ip or 'sans IP'}{note}",
-                    "ok" if d["kind"] != "other" else "info")
+            if stop():
+                break
+            yield parse_tcpdump_line(line, iface["mac"])
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
 
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
+
+def _listen_af_packet(iface, stop):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    s.bind((iface["name"], 0))
+    s.settimeout(0.5)
+    try:
+        while not stop():
+            try:
+                frame = s.recv(65535)
+            except socket.timeout:
+                yield None
+                continue
+            p = parse_eth_frame(frame)
+            yield p if p and p[0] != iface["mac"] else None
+    finally:
+        s.close()
+
+
+def _listen_windows(iface, stop):
+    if not iface["ipv4"]:
+        raise RuntimeError("Windows a besoin d'une adresse IPv4 sur l'interface pour écouter "
+                           "(même 169.254.x) : vérifie que le câble est branché.")
+    own = {a["ip"] for a in iface["ipv4"]}
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+    s.bind((iface["ipv4"][0]["ip"], 0))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+    s.settimeout(0.5)
+    try:
+        while not stop():
+            try:
+                pkt = s.recv(65535)
+            except socket.timeout:
+                yield None
+                continue
+            except OSError:
+                continue
+            p = parse_ipv4_packet(pkt)
+            yield p if p and p[1] not in own else None
+    finally:
+        try:
+            s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+        except OSError:
+            pass
+        s.close()
+
+
+def listen_backend():
+    if IS_WIN:
+        return _listen_windows, "socket brute Windows (IPv4 : DHCP, TDP, trafic IP)"
+    if IS_LINUX and not shutil_which("tcpdump"):
+        return _listen_af_packet, "socket AF_PACKET"
+    return _listen_tcpdump, "tcpdump"
+
+
+def shutil_which(name):
+    import shutil
+    return shutil.which(name, path=os.environ.get("PATH", "") + os.pathsep + "/usr/sbin:/sbin")
+
+
+def job_listen(iface_name, seconds):
+    if not IS_ROOT:
+        raise RuntimeError("l'écoute passive nécessite les droits administrateur")
+    iface = get_iface(iface_name)
+    if not iface:
+        raise RuntimeError(f"interface {iface_name} introuvable")
+    backend, label = listen_backend()
     deadline = time.time() + seconds
-    while time.time() < deadline and proc.poll() is None:
-        time.sleep(0.3)
-    if proc.poll() is None:
-        proc.terminate()
-    t.join(timeout=2)
-    macs = {m for (m, _) in seen}
-    log(f"Écoute terminée : {count[0]} trame(s), {len(macs)} émetteur(s) distinct(s).", "ok")
-    if count[0] == 0:
+
+    def stop():
+        return time.time() >= deadline or JOBS.get("listen", {}).get("stop")
+
+    log(f"Écoute passive sur {iface_name} pendant {seconds} s ({label}) — débranche/rebranche "
+        "l'alimentation PoE du Pharos maintenant pour capter ses annonces.", "ok")
+    seen, count = {}, 0
+    for p in backend(iface, stop):
+        if stop():
+            break
+        if p is None:
+            continue
+        count += 1
+        mac, ip, tdp = p
+        if ip and (ip.startswith("0.") or not (tdp or is_lan_ip(ip))):
+            ip = None  # adresse Internet routée par la passerelle : ce n'est pas son IP à elle
+        if not mac and not ip:
+            continue
+        first = (mac, ip) not in seen
+        seen[(mac, ip)] = True
+        d = upsert(mac=mac, ip=ip, source="écoute", iface=iface_name, tdp=tdp or None)
+        if d and first:
+            note = " · trafic TDP (port 20002)" if tdp else ""
+            log(f"Vu {mac or 'MAC ?'} ({d['vendor'] or 'fabricant ?'}) → {ip or 'sans IP'}{note}",
+                "ok" if d["kind"] != "other" else "info")
+    macs = {m for (m, _) in seen if m}
+    ips_seen = {i for (_, i) in seen if i}
+    log(f"Écoute terminée : {count} trame(s), {len(seen)} émetteur(s) distinct(s).", "ok")
+    if count == 0:
         log("Aucune trame reçue : lien inactif, mauvais câble, ou port isolé/VLAN différent.", "warn")
+        if IS_WIN:
+            log("Sous Windows, le pare-feu peut bloquer l'écoute : autorise Pharos Finder "
+                "sur les réseaux privés et publics si Windows le demande.", "warn")
+    # Complète les MAC manquantes (Windows ne voit que l'IP) avec la table ARP.
+    for e in arp_table():
+        if e["ip"] in ips_seen:
+            upsert(mac=e["mac"], ip=e["ip"], source="écoute", iface=iface_name)
     with LOCK:
         ids = [d["id"] for d in DEVICES.values()
-               if d["mac"] in macs and d["ip"] and not d["ip"].startswith("169.254.")]
-    reachable = []
-    for i in ids:
-        ip = DEVICES[i]["ip"]
-        if any(ipaddress.IPv4Address(ip) in n for n in iface_networks(get_iface(iface_name))):
-            reachable.append(i)
+               if (d["mac"] in macs or d["ip"] in ips_seen) and d["ip"] and not d["ip"].startswith("169.254.")]
+    nets = iface_networks(get_iface(iface_name) or iface)
+    reachable = [i for i in ids if any(ipaddress.IPv4Address(DEVICES[i]["ip"]) in n for n in nets)]
     if reachable:
         fingerprint_many(reachable)
     others = len(ids) - len(reachable)
@@ -727,24 +1062,51 @@ def job_watch(new_ip, prefix, iface_name, timeout=240):
 # ─────────────────────────── actions utilisateur ───────────────────────────
 
 def open_url(url):
+    if IS_WIN:
+        # explorer.exe transmet l'URL au shell de l'utilisateur : le navigateur ne tourne
+        # pas en administrateur même si le moteur, lui, l'est.
+        subprocess.Popen(["explorer.exe", url], creationflags=NO_WINDOW)
+        return
     r = as_user(["open", url]) if IS_MAC else as_user(["xdg-open", url])
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "ouverture impossible")
 
 
-def open_ssh(ip, user):
+def ssh_command(ip, user):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", user or ""):
         raise RuntimeError("nom d'utilisateur invalide")
     ipaddress.IPv4Address(ip)
-    ssh = (f"ssh -o StrictHostKeyChecking=accept-new "
-           f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 "
-           f"-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa {user}@{ip}")
-    if not IS_MAC:
-        raise RuntimeError(f"ouvre un terminal et lance : {ssh}")
-    script = f'tell application "Terminal"\nactivate\ndo script "{ssh}"\nend tell'
-    r = as_user(["osascript", "-e", script])
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "Terminal inaccessible")
+    opts = ["-o", "StrictHostKeyChecking=accept-new",
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa"]
+    if not IS_WIN:  # OpenSSH 7.x livré avec Windows 10 ne connaît pas cette option
+        opts += ["-o", "PubkeyAcceptedAlgorithms=+ssh-rsa"]
+    return ["ssh"] + opts + [f"{user}@{ip}"]
+
+
+def open_ssh(ip, user):
+    cmd = ssh_command(ip, user)
+    line = " ".join(cmd)
+    if IS_WIN:
+        if not shutil_which("ssh"):
+            raise RuntimeError("client SSH introuvable : active « Client OpenSSH » dans "
+                               "Paramètres → Applications → Fonctionnalités facultatives.")
+        subprocess.Popen(["cmd.exe", "/k"] + cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        return
+    if IS_MAC:
+        script = f'tell application "Terminal"\nactivate\ndo script "{line}"\nend tell'
+        r = as_user(["osascript", "-e", script])
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or "Terminal inaccessible")
+        return
+    for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
+        if shutil_which(term[0]):
+            try:
+                subprocess.Popen((["sudo", "-u", SUDO_USER] if IS_ROOT and SUDO_USER else []) + term + cmd)
+                return
+            except OSError:
+                pass
+    raise RuntimeError(f"ouvre un terminal et lance : {line}")
 
 
 def snapshot():
@@ -760,7 +1122,7 @@ def snapshot():
         order = {"pharos": 0, "tplink": 1, "other": 2}
         devs.sort(key=lambda x: (order[x["kind"]], tuple(int(p) for p in (x["ip"] or "255.255.255.255").split("."))))
         return {
-            "version": VERSION, "root": IS_ROOT, "mac_os": IS_MAC,
+            "version": VERSION, "root": IS_ROOT, "mac_os": IS_MAC, "platform": PLATFORM,
             "interfaces": ifaces, "devices": devs, "log": LOG[-200:],
             "jobs": {k: {"label": v["label"], "elapsed": int(time.time() - v["started"])} for k, v in JOBS.items()},
             "aliases": list(ALIASES),
@@ -815,6 +1177,8 @@ class Handler(BaseHTTPRequestHandler):
             extra = [s.strip() for s in re.split(r"[,\s]+", b.get("extra", "")) if s.strip()]
             start_job("scan", "Recherche", job_scan, b["iface"], bool(b.get("factory")), bool(b.get("full")), extra)
         elif path == "/api/listen":
+            if not IS_ROOT:
+                raise RuntimeError("l'écoute passive nécessite les droits administrateur")
             secs = max(10, min(int(b.get("seconds", 60)), 600))
             start_job("listen", "Écoute passive", job_listen, b["iface"], secs)
         elif path == "/api/stop":
@@ -852,13 +1216,76 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True}
 
 
+def pid_alive(pid):
+    if IS_WIN:
+        # os.kill(pid, 0) enverrait un Ctrl+C sous Windows : on interroge le processus.
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not h:
+            return False
+        try:
+            return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT : toujours vivant
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def relaunch_elevated_windows():
+    """Relance le programme via l'invite UAC. Renvoie True si l'instance admin a démarré."""
+    import ctypes
+    argv = sys.argv[1:] if getattr(sys, "frozen", False) else [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    params = subprocess.list2cmdline(argv + ["--elevated"])
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    return rc > 32
+
+
+_CONSOLE_HANDLER = None
+
+
+def install_windows_close_handler():
+    """Fermeture de la fenêtre console : on retire les alias avant que Windows ne tue le processus."""
+    global _CONSOLE_HANDLER
+    import ctypes
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(event):
+        cleanup_aliases()
+        if event in (0, 1):  # Ctrl+C / Ctrl+Break : on quitte proprement
+            os._exit(0)
+        return False
+
+    _CONSOLE_HANDLER = handler
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+
+
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # console Windows en cp850/cp1252
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="Pharos Finder — découverte des équipements TP-Link PharOS")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--token", help="jeton fixe (utilisé par l'app macOS)")
     ap.add_argument("--parent-pid", type=int, help="s'arrête quand ce processus disparaît")
+    ap.add_argument("--no-elevate", action="store_true", help="Windows : ne pas demander les droits admin")
+    ap.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if IS_WIN and not IS_ROOT and not args.no_elevate and not args.elevated:
+        print("Pharos Finder demande les droits administrateur (adresses temporaires, écoute)…")
+        if relaunch_elevated_windows():
+            return
+        print("Droits refusés : lancement en mode limité.")
 
     global TOKEN
     if args.token:
@@ -867,20 +1294,15 @@ def main():
         def _watch_parent(pid):
             while True:
                 time.sleep(2)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                if not pid_alive(pid):
                     log("Application fermée : arrêt du moteur.")
                     cleanup_aliases()
                     os._exit(0)
-                except PermissionError:
-                    pass
         threading.Thread(target=_watch_parent, args=(args.parent_pid,), daemon=True).start()
 
-    if not IS_MAC:
-        print("⚠️  Conçu pour macOS ; fonctionnement partiel ailleurs.")
     if not IS_ROOT:
-        print("⚠️  Lancé sans sudo : balayage OK, mais pas d'alias IP ni d'écoute passive.")
+        print("⚠️  Lancé sans droits administrateur : balayage OK, mais pas d'adresse temporaire "
+              "ni d'écoute passive.")
 
     atexit.register(cleanup_aliases)
 
@@ -890,15 +1312,31 @@ def main():
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _sig)  # fenêtre Terminal fermée
+    for name in ("SIGHUP", "SIGBREAK"):  # fenêtre Terminal fermée / Ctrl+Break
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _sig)
+    if IS_WIN:
+        install_windows_close_handler()
 
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = f"http://127.0.0.1:{args.port}/?t={TOKEN}"
-    print(f"\n  Pharos Finder {VERSION}\n  Interface : {url}\n  Ctrl+C pour quitter (les alias ajoutés seront retirés).\n")
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError:
+        if args.token:  # l'app impose le port : on ne le change pas en silence
+            raise
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    url = f"http://127.0.0.1:{port}/?t={TOKEN}"
+    print(f"\n  Pharos Finder {VERSION} ({PLATFORM})\n  Interface : {url}\n"
+          "  Garde cette fenêtre ouverte. Ctrl+C ou fermeture = arrêt (les adresses temporaires "
+          "sont retirées).\n")
     log("Pharos Finder prêt. Choisis l'interface reliée au Pharos puis « Rechercher ».", "ok")
     if not args.no_browser:
-        threading.Timer(0.6, lambda: open_url(url) if IS_MAC else None).start()
+        def _open():
+            try:
+                open_url(url)
+            except Exception as e:  # noqa: BLE001
+                print(f"Ouvre ce lien dans ton navigateur : {url} ({e})")
+        threading.Timer(0.6, _open).start()
     try:
         srv.serve_forever()
     finally:
@@ -1002,6 +1440,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   </div>
   <div class="spacer"></div>
   <span class="pill" id="rootPill"></span>
+  <button class="danger" id="btnQuit" title="Arrête le moteur et retire les adresses temporaires">Quitter</button>
 </header>
 
 <div class="toolbar">
@@ -1061,18 +1500,19 @@ async function refresh(){
 function render(){
   $('ver').textContent = 'v' + S.version;
   const rp = $('rootPill');
-  rp.textContent = S.root ? 'Mode admin' : 'Sans sudo : alias et écoute indisponibles';
+  rp.textContent = S.root ? 'Droits admin' : 'Sans droits admin : adresses temporaires et écoute indisponibles';
   rp.className = 'pill' + (S.root ? '' : ' warn');
 
   // interfaces
   const sel = $('iface'), cur = sel.value;
   sel.innerHTML = S.interfaces.map(i => {
     const ips = i.ipv4.map(a => a.ip + '/' + a.prefix).join(', ') || 'sans IP';
-    return `<option value="${esc(i.name)}">${i.active ? '●' : '○'} ${esc(i.name)} — ${esc(i.label)} — ${esc(ips)}</option>`;
+    const lbl = i.label && i.label !== i.name ? `${esc(i.name)} — ${esc(i.label)}` : esc(i.name);
+    return `<option value="${esc(i.name)}">${i.active ? '●' : '○'} ${lbl} — ${esc(ips)}</option>`;
   }).join('');
   if(cur && S.interfaces.some(i => i.name === cur)) sel.value = cur;
   else if(!ifaceTouched){
-    const wired = S.interfaces.find(i => i.active && i.label !== 'Wi-Fi' && i.ipv4.length) || S.interfaces.find(i => i.active) || S.interfaces[0];
+    const wired = S.interfaces.find(i => i.active && !i.wireless && i.ipv4.length) || S.interfaces.find(i => i.active && !i.wireless) || S.interfaces.find(i => i.active) || S.interfaces[0];
     if(wired) sel.value = wired.name;
   }
 
@@ -1146,7 +1586,7 @@ function renderDetail(){
       ${d.ip && !d.in_range ? `<button class="primary" data-act="reach" ${busy||!S.root?'disabled':''}>Rendre joignable (alias ${esc(guessNet)}x sur ${esc(d.iface || $('iface').value)})</button>` : ''}
       <button ${d.ip?'':'disabled'} data-act="web" class="${d.in_range && hasWeb ? 'primary' : ''}">Ouvrir l'interface web (https)</button>
       <button ${d.ip?'':'disabled'} data-act="webhttp">Ouvrir en http</button>
-      <button ${d.ip?'':'disabled'} data-act="ssh">Session SSH dans Terminal…</button>
+      <button ${d.ip?'':'disabled'} data-act="ssh">Session SSH…</button>
       <button ${d.ip&&!busy?'':'disabled'} data-act="refresh">Ré-identifier</button>
     </div>
     <div class="card">
@@ -1180,8 +1620,9 @@ document.addEventListener('click', async e => {
   const act = a.dataset.act;
   try{
     if(act === 'reach') await api('/api/reach', {id:d.id, iface:d.iface || $('iface').value, prefix:24});
-    if(act === 'web') await api('/api/open', {ip:d.ip, scheme:'https'});
-    if(act === 'webhttp') await api('/api/open', {ip:d.ip, scheme:'http'});
+    // Ouvert par le navigateur lui-même : jamais par le moteur administrateur.
+    if(act === 'web') window.open(`https://${d.ip}/`, '_blank', 'noopener');
+    if(act === 'webhttp') window.open(`http://${d.ip}/`, '_blank', 'noopener');
     if(act === 'ssh') await api('/api/ssh', {ip:d.ip, user:($('sshUser')||{}).value || 'admin'});
     if(act === 'refresh') await api('/api/refresh', {id:d.id});
     if(act === 'watch'){
@@ -1196,8 +1637,14 @@ $('iface').addEventListener('change', () => { ifaceTouched = true; });
 $('btnScan').onclick = () => api('/api/scan', {iface:$('iface').value, factory:$('factory').checked, full:$('full').checked, extra:$('extra').value}).catch(()=>{});
 $('btnListen').onclick = () => api('/api/listen', {iface:$('iface').value, seconds:+$('secs').value || 60}).catch(()=>{});
 $('btnStop').onclick = () => api('/api/stop').catch(()=>{});
+$('btnQuit').onclick = async () => {
+  if(!confirm('Arrêter Pharos Finder ? Les adresses temporaires seront retirées.')) return;
+  try{ await fetch('/api/quit', {method:'POST', headers:{'Content-Type':'application/json','X-Token':TOKEN}, body:'{}'}); }catch(_){}
+  clearInterval(POLL);
+  document.body.innerHTML = '<div class="empty" style="margin:auto"><b>Pharos Finder est arrêté</b>Tu peux fermer cet onglet.</div>';
+};
 
-refresh(); setInterval(refresh, 1000);
+refresh(); const POLL = setInterval(refresh, 1000);
 </script>
 </body>
 </html>"""

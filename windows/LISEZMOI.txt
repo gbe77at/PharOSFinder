@@ -1,0 +1,34 @@
+Pharos Finder pour Windows
+==========================
+
+Trouve les équipements TP-Link PharOS (CPE510, CPE710, CPE210/220/610, WBS…) sur ton
+réseau, rends-les joignables et ouvre leur interface web.
+
+Lancement
+---------
+1. Double-clique sur PharosFinder.exe.
+   Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » (app non signée) :
+   clique sur « Informations complémentaires » puis « Exécuter quand même ».
+2. Accepte la demande d'administrateur (UAC). Elle sert à poser des adresses IP temporaires
+   et à écouter le câble. Si tu refuses, l'app marche en mode limité (balayage seulement).
+3. L'interface s'ouvre dans ton navigateur. Garde la fenêtre noire ouverte : la fermer
+   arrête Pharos Finder et retire les adresses temporaires.
+
+Utilisation
+-----------
+- Choisis la carte réseau reliée au Pharos (● = câble actif), puis « Rechercher ».
+  L'app balaye ta plage et les plages d'usine PharOS (192.168.0.254).
+- Pharos dans une plage inconnue : « Écoute passive », puis débranche/rebranche
+  l'alimentation PoE du Pharos pendant l'écoute.
+- Sélectionne l'équipement : « Rendre joignable », « Ouvrir l'interface web » (admin/admin
+  en usine), « Session SSH ».
+
+Notes
+-----
+- Windows 10 version 2004 ou plus récent, ou Windows 11.
+- Si le pare-feu Windows demande l'accès pour PharosFinder, autorise-le : c'est nécessaire
+  pour l'écoute passive.
+- La session SSH utilise le client OpenSSH de Windows (Paramètres → Applications →
+  Fonctionnalités facultatives → Client OpenSSH).
+- Les adresses temporaires sont posées « jusqu'au redémarrage » seulement : même en cas de
+  plantage, un redémarrage de Windows les efface.

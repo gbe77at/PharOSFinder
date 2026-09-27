@@ -1,0 +1,81 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tests unitaires
+        run: python -m unittest discover -v tests
+      - name: Test de fumée (moteur réel, sans droits admin)
+        run: python tests/smoke.py
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Outils
+        run: python -m pip install pyinstaller pillow
+      - name: Icône
+        run: python -c "from PIL import Image; Image.open('Resources/AppIcon.iconset/icon_256x256.png').save('PharosFinder.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Exécutable
+        run: pyinstaller --noconfirm --onefile --console --name PharosFinder --icon PharosFinder.ico Resources/pharos_finder.py
+      - name: Test de fumée de l'exe
+        run: python tests/smoke.py dist/PharosFinder.exe
+      - name: Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item dist/PharosFinder.exe pkg/
+          Copy-Item windows/LISEZMOI.txt pkg/
+          Compress-Archive -Path pkg/* -DestinationPath PharosFinder-Windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PharosFinder-Windows
+          path: PharosFinder-Windows.zip
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: App + DMG
+        run: ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PharosFinder-macOS
+          path: build/PharosFinder.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Pharos Finder $GITHUB_REF_NAME" --generate-notes \
+            PharosFinder-Windows/PharosFinder-Windows.zip PharosFinder-macOS/PharosFinder.dmg

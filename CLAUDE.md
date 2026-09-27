@@ -2,7 +2,7 @@
 
 ## Mission
 
-Finaliser et livrer **Pharos Finder**, une app macOS native (SwiftUI) pour découvrir les équipements **TP-Link PharOS** (CPE210/510/610, WBS…) sur le réseau local, les rendre joignables et ouvrir leur configuration. L'app s'inspire de Pharos Control (TP-Link) et de QNAP Finder.
+Finaliser et livrer **Pharos Finder**, une app macOS native (SwiftUI) pour découvrir les équipements **TP-Link PharOS** (CPE510 et CPE710 en priorité ; CPE210/220/520/605/610, WBS…) sur le réseau local, les rendre joignables et ouvrir leur configuration. L'app s'inspire de Pharos Control (TP-Link) et de QNAP Finder.
 
 **Livrable attendu :** `build/PharosFinder.dmg`, contenant une app universelle (arm64 + x86_64) signée ad hoc, qui se lance et trouve un Pharos.
 
@@ -139,6 +139,25 @@ Vérifier que `interfaces` contient `en11` avec son label, et qu'aucun alias ne 
 - `freePort()` utilise les sockets BSD (`bind` / `getsockname`). En cas de conflit de nom, qualifier avec `Darwin.bind`.
 - `NSAppleScript.executeAndReturnError` renvoie une valeur non utilisée : un avertissement est acceptable.
 - Si le SDK impose des isolations `@MainActor` (Xcode récent), annoter les méthodes concernées plutôt que de rendre `Engine` entièrement `@MainActor`.
+
+## Windows et Linux (PC)
+
+Le même moteur `pharos_finder.py` tourne sur Windows et Linux ; il sert alors son UI web
+(`/?t=<jeton>`) dans le navigateur. Couche plateforme dans le moteur :
+
+| | macOS | Windows | Linux (dont DGX Spark ARM64) |
+|---|---|---|---|
+| Interfaces | `ifconfig` + `networksetup` | PowerShell `Get-NetAdapter`/`Get-NetIPAddress` (JSON, cache 4 s) | `ip -j addr` |
+| ARP | `arp -an` | `arp -a` (index d'interface en hexa → nom) | `ip -4 neigh` |
+| Alias | `ifconfig alias` | `netsh … add address store=active` (+ coexistence DHCP/statique si besoin, remise à l'état initial) | `ip addr add` |
+| Écoute | `tcpdump` | socket brute `SIO_RCVALL` (IPv4 seulement : DHCP → MAC, TDP, IP) | `tcpdump`, sinon `AF_PACKET` |
+| Droits | `do shell script … with administrator privileges` | relance UAC (`ShellExecuteW runas`), refus → mode limité | `sudo` |
+
+- Windows : `ping` renvoie 0 même si l'hôte est injoignable → on teste « TTL= ». `os.kill(pid, 0)`
+  enverrait un Ctrl+C → `pid_alive` passe par `OpenProcess`. Fermeture de la console : `SetConsoleCtrlHandler`.
+- Le navigateur n'est jamais lancé en admin (`explorer.exe <url>` ; l'UI web ouvre les pages elle-même).
+- `.github/workflows/build.yml` : tests + smoke test (`tests/smoke.py`) sur macOS, Windows, Linux x64 et
+  ARM64 ; `PharosFinder.exe` (PyInstaller, onefile, console) ; DMG ; release sur tag `v*`.
 
 ## Hors périmètre
 

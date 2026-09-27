@@ -26,8 +26,10 @@ struct NetIface: Decodable, Identifiable, Hashable {
     var label: String
     var active: Bool
     var aliases: [String]
+    var wireless: Bool?
 
     var id: String { name }
+    var isWireless: Bool { wireless ?? label.lowercased().contains("wi-fi") }
     var summary: String { ipv4.map { "\($0.ip)/\($0.prefix)" }.joined(separator: ", ") }
     var menuTitle: String {
         let dot = active ? "●" : "○"
