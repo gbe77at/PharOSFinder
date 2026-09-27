@@ -1436,7 +1436,12 @@ def job_reach(dev_id, iface_name, prefix):
     fingerprint(dev_id)
     with LOCK:
         ok = DEVICES[dev_id]["reachable"]
+        announced = DEVICES[dev_id].get("announced")
     log(f"{ip} {'joignable' if ok else 'ne répond toujours pas'}", "ok" if ok else "warn")
+    if not ok and announced:
+        log(f"Il s'annonce en {announced} avec {ip} mais ignore les requêtes du câble : sa gestion est "
+            "verrouillée côté LAN (VLAN de gestion activé, ou contrôle d'accès PharOS). Relie-le "
+            "directement au Mac et indique le numéro de VLAN, ou fais un reset.", "warn")
 
 
 def job_watch(new_ip, prefix, iface_name, timeout=240):
