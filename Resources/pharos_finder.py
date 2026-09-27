@@ -1152,6 +1152,44 @@ def shutil_which(name):
     return shutil.which(name, path=os.environ.get("PATH", "") + os.pathsep + "/usr/sbin:/sbin")
 
 
+TDP_PCAP = os.path.join("C:\\Windows\\Temp" if IS_WIN else "/tmp", "PharosFinder-tdp.pcap")
+
+
+def start_tdp_capture(iface_name):
+    """Enregistre les trames TDP (UDP 20001/20002) brutes dans un pcap, pour étudier la
+    découverte de Pharos Control sans en inventer le format."""
+    if IS_WIN or not shutil_which("tcpdump"):
+        return None
+    try:
+        os.remove(TDP_PCAP)
+    except OSError:
+        pass
+    try:
+        return subprocess.Popen(["tcpdump", "-i", iface_name, "-U", "-s", "0", "-w", TDP_PCAP,
+                                 "udp port 20001 or udp port 20002"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def stop_tdp_capture(proc):
+    if not proc:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        os.chmod(TDP_PCAP, 0o644)
+        size = os.path.getsize(TDP_PCAP)
+    except OSError:
+        return
+    if size > 24:  # plus que l'en-tête pcap : du trafic TDP a été vu
+        log(f"Trafic TDP enregistré : {TDP_PCAP} ({size} octets).", "ok")
+
+
 def job_listen(iface_name, seconds):
     if not IS_ROOT:
         raise RuntimeError("l'écoute passive nécessite les droits administrateur")
@@ -1166,6 +1204,7 @@ def job_listen(iface_name, seconds):
 
     log(f"Écoute passive sur {iface_name} pendant {seconds} s ({label}) — débranche/rebranche "
         "l'alimentation PoE du Pharos maintenant pour capter ses annonces.", "ok")
+    tdp_cap = start_tdp_capture(iface_name)
     seen, count = {}, 0
     for p in backend(iface, stop):
         if stop():
@@ -1188,6 +1227,7 @@ def job_listen(iface_name, seconds):
     macs = {m for (m, _) in seen if m}
     ips_seen = {i for (_, i) in seen if i}
     log(f"Écoute terminée : {count} trame(s), {len(seen)} émetteur(s) distinct(s).", "ok")
+    stop_tdp_capture(tdp_cap)
     if count == 0:
         log("Aucune trame reçue : lien inactif, mauvais câble, ou port isolé/VLAN différent.", "warn")
         if IS_WIN:
