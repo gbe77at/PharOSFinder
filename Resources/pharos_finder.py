@@ -495,6 +495,10 @@ def remove_alias(iface, ip):
 
 
 def cleanup_aliases():
+    try:
+        cleanup_vlans()
+    except Exception:
+        pass
     with LOCK:
         pending = list(ALIASES)
     for a in pending:
@@ -817,6 +821,84 @@ def discover_ipv6(iface):
         "ok" if ids else "info")
     if ids:
         fingerprint_many(ids)
+
+
+# ─────────────────── VLAN de gestion (PharOS « Management VLAN ») ───────────────────
+
+VLAN_IFACES = []   # interfaces VLAN créées par l'outil, détruites à la fermeture
+COMMON_VLANS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 30, 40, 50, 99, 100, 101, 200, 254, 1000]
+
+
+def _vlan_create(parent, vid, ip, mask):
+    if IS_MAC:
+        name = run(["ifconfig", "vlan", "create"]).stdout.strip()
+        if not name:
+            raise RuntimeError("création d'interface VLAN refusée")
+        run(["ifconfig", name, "vlan", str(vid), "vlandev", parent])
+        run(["ifconfig", name, "inet", ip, "netmask", mask, "up"])
+    else:
+        name = f"pf{vid}"
+        run(["ip", "link", "add", "link", parent, "name", name, "type", "vlan", "id", str(vid)])
+        run(["ip", "addr", "add", f"{ip}/{_prefix_of(mask)}", "dev", name])
+        run(["ip", "link", "set", name, "up"])
+    VLAN_IFACES.append(name)
+    invalidate_interfaces()
+    return name
+
+
+def _vlan_destroy(name):
+    run(["ifconfig", name, "destroy"] if IS_MAC else ["ip", "link", "del", name])
+    if name in VLAN_IFACES:
+        VLAN_IFACES.remove(name)
+    invalidate_interfaces()
+
+
+def cleanup_vlans():
+    for name in list(VLAN_IFACES):
+        _vlan_destroy(name)
+
+
+def _ping_via(name, ip):
+    cmd = ["ping", "-c", "2", "-W", "700", "-b", name, ip] if IS_MAC else ["ping", "-c", "2", "-W", "1", "-I", name, ip]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def job_vlan_probe(iface_name, target, vlans):
+    """Cherche le VLAN de gestion d'un Pharos qui s'annonce mais ignore le trafic non étiqueté.
+    Ne vise que l'adresse `target` ; chaque interface VLAN d'essai est détruite aussitôt."""
+    if IS_WIN:
+        raise RuntimeError("le test de VLAN n'est pas disponible sous Windows")
+    if not IS_ROOT:
+        raise RuntimeError("droits administrateur requis")
+    net = ipaddress.ip_network(f"{target}/24", strict=False)
+    # Une adresse de l'outil dans ce /24 sur l'interface physique capterait la route : on la retire.
+    with LOCK:
+        mine = [a for a in ALIASES if a["iface"] == iface_name and ipaddress.IPv4Address(a["ip"]) in net]
+    for a in mine:
+        remove_alias(a["iface"], a["ip"])
+    local = pick_alias_ip(net, avoid={target})
+    log(f"Test des VLAN de gestion sur {iface_name} vers {target} : {', '.join(map(str, vlans))}…")
+    for vid in vlans:
+        if JOBS.get("vlan", {}).get("stop"):
+            log("Test des VLAN interrompu.", "warn")
+            return
+        name = _vlan_create(iface_name, vid, local, str(net.netmask))
+        time.sleep(1.5)
+        if _ping_via(name, target):
+            log(f"VLAN {vid} : {target} répond ! Interface {name} ({local}) gardée jusqu'à la fermeture. "
+                f"Ouvre https://{target}/ puis, dans PharOS, désactive le Management VLAN ou change "
+                "l'IP pour ne plus en dépendre.", "ok")
+            with LOCK:
+                d = next((x for x in DEVICES.values() if x["ip"] == target), None)
+            if d:
+                fingerprint(d["id"])
+            return
+        _vlan_destroy(name)
+    log(f"Aucun des VLAN testés ne donne accès à {target}. Si tu connais le numéro, indique-le ; "
+        "sinon le contrôle d'accès PharOS bloque la gestion et seul un reset la rendra.", "warn")
 
 
 TUNNELS = {}   # id équipement -> {"port", "target"}
@@ -1598,6 +1680,10 @@ class Handler(BaseHTTPRequestHandler):
                         j["proc"].terminate()
         elif path == "/api/reach":
             start_job("reach", "Rendre joignable", job_reach, b["id"], b.get("iface"), int(b.get("prefix", 24)))
+        elif path == "/api/vlan":
+            vl = [int(v) for v in re.split(r"[,\s]+", str(b.get("vlans", ""))) if v.strip()] or COMMON_VLANS
+            vl = [v for v in vl if 1 <= v <= 4094][:64]
+            start_job("vlan", "Test des VLAN", job_vlan_probe, b["iface"], str(ipaddress.IPv4Address(b["ip"])), vl)
         elif path == "/api/refresh":
             start_job("refresh", "Identification", fingerprint, b["id"])
         elif path == "/api/watch":
@@ -1717,6 +1803,7 @@ def main():
 
     atexit.register(cleanup_aliases)
     atexit.register(stop_sniffers)
+    atexit.register(cleanup_vlans)
     threading.Thread(target=announcement_sniffer, daemon=True).start()
 
     def _sig(*_):
