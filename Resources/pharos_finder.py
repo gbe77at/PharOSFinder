@@ -80,7 +80,7 @@ TPLINK_OUIS = {
     "9c:a2:f4", "a0:f3:c1", "a4:2b:b0", "a8:42:a1", "ac:84:c6", "b0:4e:26", "b0:95:75",
     "b0:be:76", "b4:b0:24", "c0:06:c3", "c0:25:e9", "c0:4a:00", "c4:6e:1f", "c4:e9:84",
     "cc:32:e5", "d4:6e:0e", "d8:07:b6", "e4:c3:2a", "e8:94:f6", "ec:08:6b", "ec:17:2f",
-    "f4:ec:38", "f8:1a:67",
+    "f4:ec:38", "f8:1a:67", "6c:4c:bc", "50:7b:9d",
 }
 
 SKIP_IFACE_PREFIXES = ("lo", "gif", "stf", "utun", "awdl", "llw", "anpi", "ap", "bridge", "vmenet", "docker", "veth")
@@ -93,6 +93,7 @@ LOG = []            # entrées de journal
 JOBS = {}           # nom -> {"label", "started", "proc"?}
 ALIASES = []        # [{"iface", "ip", "mask", "keep_reason"}]
 VENDOR_CACHE = {}
+CONFLICTS = set()
 VENDOR_LOCK = threading.Lock()
 TOKEN = secrets.token_urlsafe(16)
 
@@ -611,7 +612,7 @@ def ssh_banner(ip):
     try:
         with socket.create_connection((ip, 22), timeout=2) as s:
             s.settimeout(2)
-            return s.recv(256).decode("utf-8", "ignore").strip() or None
+            return s.recv(256).decode("utf-8", "ignore").splitlines()[0].strip() or None
     except OSError:
         return None
 
@@ -644,7 +645,7 @@ def http_probe(ip, open_ports):
     for url in tries:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 PharosFinder"})
-            with opener.open(req, timeout=5) as r:
+            with opener.open(req, timeout=10) as r:  # PharOS répond lentement
                 body = r.read(300_000).decode("utf-8", "ignore")
                 final = r.geturl()
                 server = r.headers.get("Server")
@@ -673,7 +674,8 @@ def _new_device(key, mac, ip):
             "iface": None, "model": None, "title": None, "server": None, "ports": [],
             "ssh": None, "sources": [], "tdp": False, "pharos_hint": False,
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
-            "fingerprinted": False, "ipv6": None, "web_local": None}
+            "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
+            "announced": None}
 
 
 def classify(d):
@@ -712,6 +714,11 @@ def upsert(mac=None, ip=None, source=None, **fields):
                 d["ips"].append(ip)
             if not ip.startswith("169.254.") or not d["ip"]:
                 d["ip"] = ip
+            others = [o["mac"] for o in DEVICES.values() if o is not d and o["ip"] == ip and o["mac"]]
+            if mac and others and (ip, mac) not in CONFLICTS:
+                CONFLICTS.add((ip, mac))
+                log(f"Conflit d'adresse : {ip} est utilisée par {mac} et {', '.join(others)}. "
+                    "Débranche l'un des deux ou change son IP.", "warn")
         if source and source not in d["sources"]:
             d["sources"].append(source)
         for k, v in fields.items():
@@ -1021,6 +1028,149 @@ def parse_tcpdump_line(line, self_mac=None):
     return src, ip, tdp
 
 
+# ─────────────── annonces CDP / LLDP (PharOS : CDP toutes les 60 s) ───────────────
+
+CDP_DST = bytes.fromhex("01000ccccccc")
+
+
+def _cdp_addresses(v):
+    ips, p = [], 4
+    for _ in range(struct.unpack("!I", v[:4])[0] if len(v) >= 4 else 0):
+        if p + 2 > len(v):
+            break
+        ptype, plen = v[p], v[p + 1]
+        proto = v[p + 2:p + 2 + plen]
+        p += 2 + plen
+        alen = struct.unpack("!H", v[p:p + 2])[0] if p + 2 <= len(v) else 0
+        addr = v[p + 2:p + 2 + alen]
+        p += 2 + alen
+        if ptype == 1 and proto == b"\xcc" and alen == 4:
+            ips.append(socket.inet_ntoa(addr))
+    return ips
+
+
+def parse_discovery(frame):
+    """Annonce CDP ou LLDP → {mac, ip, name, platform, firmware, proto} (ou None)."""
+    if len(frame) < 22:
+        return None
+    src = ":".join(f"{b:02x}" for b in frame[6:12])
+    txt = lambda b: b.decode("utf-8", "ignore").strip().strip("\x00")  # noqa: E731
+    info = {"mac": src, "ip": None, "name": None, "platform": None, "firmware": None}
+    etype = struct.unpack("!H", frame[12:14])[0]
+    if frame[:6] == CDP_DST and etype <= 1500 and frame[14:17] == b"\xaa\xaa\x03" \
+            and frame[17:20] == b"\x00\x00\x0c" and frame[20:22] == b"\x20\x00":
+        info["proto"] = "CDP"
+        p, cdp = 4, frame[22:]
+        while p + 4 <= len(cdp):
+            t, ln = struct.unpack("!HH", cdp[p:p + 4])
+            if ln < 4:
+                break
+            v = cdp[p + 4:p + ln]
+            p += ln
+            if t == 0x01:
+                info["name"] = txt(v)
+            elif t in (0x02, 0x16) and not info["ip"]:
+                ips = _cdp_addresses(v)
+                info["ip"] = ips[0] if ips else None
+            elif t == 0x05:
+                info["firmware"] = txt(v)
+            elif t == 0x06:
+                info["platform"] = txt(v)
+        return info
+    if etype == 0x88CC:
+        info["proto"] = "LLDP"
+        p = 14
+        while p + 2 <= len(frame):
+            h = struct.unpack("!H", frame[p:p + 2])[0]
+            t, ln = h >> 9, h & 0x1FF
+            v = frame[p + 2:p + 2 + ln]
+            p += 2 + ln
+            if t == 0:
+                break
+            if t == 5:
+                info["name"] = txt(v)
+            elif t == 6:
+                info["platform"] = txt(v)
+            elif t == 8 and len(v) >= 6 and v[1] == 1 and not info["ip"]:
+                info["ip"] = socket.inet_ntoa(v[2:6])
+        return info
+    return None
+
+
+ANNOUNCED = set()
+
+
+def handle_discovery_frame(frame, iface_name):
+    info = parse_discovery(frame)
+    if not info:
+        return
+    ip = info["ip"] if info["ip"] and info["ip"] != "0.0.0.0" else None
+    platform = info["platform"] or ""
+    model = PHAROS_MODEL_RE.search(platform) or PHAROS_MODEL_RE.search(info["name"] or "")
+    pharos = bool(model) and "tp-link" in platform.lower()
+    d = upsert(mac=info["mac"], ip=ip, source=info["proto"], iface=iface_name,
+               model=model.group(1).upper() if model else None, title=platform or info["name"],
+               firmware=info["firmware"], announced=info["proto"], pharos_hint=pharos or None)
+    key = (info["mac"], ip)
+    if d and key not in ANNOUNCED:
+        ANNOUNCED.add(key)
+        fw = f", firmware {info['firmware']}" if info["firmware"] else ""
+        where = ip or "sans IPv4"
+        log(f"{info['proto']} : {platform or info['name'] or info['mac']} ({info['mac']}{fw}) annonce {where} "
+            f"sur {iface_name}", "ok" if d["kind"] == "pharos" else "info")
+        if ip and d["kind"] != "other" and not d.get("fingerprinted"):
+            threading.Thread(target=_fingerprint_if_reachable, args=(d["id"],), daemon=True).start()
+
+
+def _fingerprint_if_reachable(dev_id):
+    with LOCK:
+        d = DEVICES.get(dev_id)
+        ip = d["ip"] if d else None
+    if ip and any(ipaddress.IPv4Address(ip) in n for i in list_interfaces() for n in iface_networks(i)):
+        fingerprint(dev_id)
+
+
+ANNOUNCE_FILTER = "ether dst 01:00:0c:cc:cc:cc or ether proto 0x88cc"
+_SNIFFERS = {}   # interface -> Popen
+
+
+def announcement_sniffer():
+    """Écoute en permanence les annonces CDP/LLDP sur chaque interface active : un Pharos
+    configuré est trouvé en moins d'une minute, quelle que soit sa plage IP, sans rien faire."""
+    if not IS_ROOT or IS_WIN or not shutil_which("tcpdump"):
+        return
+    while True:
+        try:
+            active = {i["name"] for i in list_interfaces() if i["active"]}
+            for name, proc in list(_SNIFFERS.items()):
+                if name not in active or proc.poll() is not None:
+                    if proc.poll() is None:
+                        proc.terminate()
+                    del _SNIFFERS[name]
+            for name in active - set(_SNIFFERS):
+                proc = subprocess.Popen(["tcpdump", "-i", name, "-U", "-s", "0", "-w", "-", ANNOUNCE_FILTER],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                _SNIFFERS[name] = proc
+
+                def reader(p=proc, n=name):
+                    for frame in iter_pcap(p.stdout):
+                        try:
+                            handle_discovery_frame(frame, n)
+                        except Exception as e:  # noqa: BLE001
+                            log(f"Annonce illisible sur {n} : {e}", "warn")
+
+                threading.Thread(target=reader, daemon=True).start()
+        except Exception as e:  # noqa: BLE001
+            log(f"Écoute des annonces : {e}", "warn")
+        time.sleep(10)
+
+
+def stop_sniffers():
+    for proc in _SNIFFERS.values():
+        if proc.poll() is None:
+            proc.terminate()
+
+
 TDP_PORTS = {20001, 20002}
 
 
@@ -1068,15 +1218,32 @@ def parse_eth_frame(frame):
     return src, None, False
 
 
+def iter_pcap(stream):
+    """Lit un flux pcap (tcpdump -w -) et renvoie les trames Ethernet une par une."""
+    head = stream.read(24)
+    if len(head) < 24:
+        return
+    endian = "<" if head[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
+    while True:
+        rec = stream.read(16)
+        if len(rec) < 16:
+            return
+        incl = struct.unpack(endian + "IIII", rec)[2]
+        frame = stream.read(incl)
+        if len(frame) < incl:
+            return
+        yield frame
+
+
 def _listen_tcpdump(iface, stop):
-    cmd = ["tcpdump", "-i", iface["name"], "-n", "-e", "-l"]
+    cmd = ["tcpdump", "-i", iface["name"], "-U", "-s", "0", "-w", "-"]
     if iface["mac"]:
         cmd += ["not", "ether", "src", iface["mac"]]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
     with LOCK:
         JOBS["listen"]["proc"] = proc
 
-    def _watchdog():  # readline() bloque tant qu'aucune trame n'arrive
+    def _watchdog():  # read() bloque tant qu'aucune trame n'arrive
         while proc.poll() is None and not stop():
             time.sleep(0.3)
         if proc.poll() is None:
@@ -1084,10 +1251,11 @@ def _listen_tcpdump(iface, stop):
 
     threading.Thread(target=_watchdog, daemon=True).start()
     try:
-        for line in proc.stdout:
+        for frame in iter_pcap(proc.stdout):
             if stop():
                 break
-            yield parse_tcpdump_line(line, iface["mac"])
+            handle_discovery_frame(frame, iface["name"])
+            yield parse_eth_frame(frame)
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -1104,6 +1272,7 @@ def _listen_af_packet(iface, stop):
             except socket.timeout:
                 yield None
                 continue
+            handle_discovery_frame(frame, iface["name"])
             p = parse_eth_frame(frame)
             yield p if p and p[0] != iface["mac"] else None
     finally:
@@ -1165,8 +1334,11 @@ def start_tdp_capture(iface_name):
     except OSError:
         pass
     try:
+        # TDP + toute trame émise par une MAC TP-Link (LLDP, IPv6, DHCP… : on veut tout voir).
+        ouis = " or ".join(f"(ether[6:2] = 0x{o[0:2]}{o[3:5]} and ether[8] = 0x{o[6:8]})"
+                           for o in sorted(TPLINK_OUIS))
         return subprocess.Popen(["tcpdump", "-i", iface_name, "-U", "-s", "0", "-w", TDP_PCAP,
-                                 "udp port 20001 or udp port 20002"],
+                                 f"udp port 20001 or udp port 20002 or {ouis}"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None
@@ -1187,7 +1359,7 @@ def stop_tdp_capture(proc):
     except OSError:
         return
     if size > 24:  # plus que l'en-tête pcap : du trafic TDP a été vu
-        log(f"Trafic TDP enregistré : {TDP_PCAP} ({size} octets).", "ok")
+        log(f"Trafic TDP / TP-Link enregistré : {TDP_PCAP} ({size} octets).", "ok")
 
 
 def job_listen(iface_name, seconds):
@@ -1346,6 +1518,8 @@ def snapshot():
         devs = []
         for d in DEVICES.values():
             c = dict(d)
+            c["conflict"] = bool(d["ip"]) and any(o is not d and o["ip"] == d["ip"] and o["mac"]
+                                                  for o in DEVICES.values())
             c["in_range"] = bool(d["ip"]) and not d["ip"].startswith("169.254.") and \
                 any(ipaddress.IPv4Address(d["ip"]) in n for _, n in nets)
             devs.append(c)
@@ -1435,6 +1609,7 @@ class Handler(BaseHTTPRequestHandler):
             def _bye():
                 time.sleep(0.2)
                 cleanup_aliases()
+                stop_sniffers()
                 os._exit(0)
             threading.Thread(target=_bye, daemon=True).start()
         elif path == "/api/clear":
@@ -1527,6 +1702,7 @@ def main():
                 if not pid_alive(pid):
                     log("Application fermée : arrêt du moteur.")
                     cleanup_aliases()
+                    stop_sniffers()
                     os._exit(0)
         threading.Thread(target=_watch_parent, args=(args.parent_pid,), daemon=True).start()
 
@@ -1535,9 +1711,12 @@ def main():
               "ni d'écoute passive.")
 
     atexit.register(cleanup_aliases)
+    atexit.register(stop_sniffers)
+    threading.Thread(target=announcement_sniffer, daemon=True).start()
 
     def _sig(*_):
         cleanup_aliases()
+        stop_sniffers()
         os._exit(0)
 
     signal.signal(signal.SIGINT, _sig)
@@ -1764,6 +1943,8 @@ function render(){
     const name = d.model || (d.kind === 'pharos' ? 'PharOS' : d.title) || (d.kind === 'tplink' ? 'TP-Link' : 'Équipement');
     const svc = (d.ports||[]).map(p => `<span class="tag">${{22:'SSH',80:'HTTP',443:'HTTPS'}[p]||p}</span>`).join('')
       + (d.tdp ? '<span class="tag tdp">TDP</span>' : '')
+      + (d.announced ? `<span class="tag tdp">${esc(d.announced)}</span>` : '')
+      + (d.conflict ? '<span class="tag out" style="color:var(--err)">conflit IP</span>' : '')
       + (d.ip && !d.in_range ? '<span class="tag out">hors plage</span>' : '');
     return `<tr class="row ${d.id === selected ? 'sel' : ''}" data-id="${esc(d.id)}">
       <td><span class="dot ${d.kind}"></span>${esc(name)}</td>
@@ -1811,6 +1992,7 @@ function renderDetail(){
       <dt>Joignable</dt><dd>${d.reachable === null ? '<span class="hint">non testé</span>' : d.reachable ? 'oui' : 'non'}${d.ip && !d.in_range ? ' · <span style="color:var(--warn)">hors de tes plages</span>' : ''}</dd>
       <dt>SSH</dt><dd class="mono">${esc(d.ssh || '—')}</dd>
       <dt>Serveur web</dt><dd>${esc(d.server || '—')}</dd>
+      ${d.firmware ? `<dt>Firmware</dt><dd>${esc(d.firmware)}</dd>` : ''}
       <dt>Source</dt><dd>${esc(d.sources.join(', '))}</dd>
     </dl>
     <div class="actions">

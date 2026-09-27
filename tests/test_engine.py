@@ -152,6 +152,56 @@ class Ipv6Tests(unittest.TestCase):
             pf.ssh_command("fe80::1%en11;ls", "admin")
 
 
+# Annonce CDP réelle d'un CPE510 v3.0 (firmware 2.2.3), capturée sur le terrain.
+CPE510_CDP = bytes.fromhex(
+    "01000ccccccccc32e59da9a4007caaaa0300000c2000017836a30001000a43504535313000020011000000010101cc"
+    "0004c0a800fe00040008000000020005002a322e322e33204275696c642032303230313032382052656c2e2035353232"
+    "30202834353535290006001754502d4c494e4b204350453531302076332e300003000762723000ff00052e")
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_cdp_cpe510(self):
+        info = pf.parse_discovery(CPE510_CDP)
+        self.assertEqual(info["proto"], "CDP")
+        self.assertEqual(info["mac"], "cc:32:e5:9d:a9:a4")
+        self.assertEqual(info["ip"], "192.168.0.254")
+        self.assertEqual(info["name"], "CPE510")
+        self.assertEqual(info["platform"], "TP-LINK CPE510 v3.0")
+        self.assertTrue(info["firmware"].startswith("2.2.3 Build 20201028"))
+
+    def test_cdp_creates_pharos_device(self):
+        pf.DEVICES.clear()
+        pf.handle_discovery_frame(CPE510_CDP, "en11")
+        d = pf.DEVICES["cc:32:e5:9d:a9:a4"]
+        self.assertEqual((d["ip"], d["model"], d["kind"], d["announced"]), ("192.168.0.254", "CPE510", "pharos", "CDP"))
+
+    def test_lldp(self):
+        def tlv(t, v):
+            return struct.pack("!H", (t << 9) | len(v)) + v
+        body = tlv(5, b"CPE710") + tlv(6, b"TP-LINK CPE710 v1.0") \
+            + tlv(8, bytes([5, 1]) + socket.inet_aton("172.20.1.9") + b"\x02\0\0\0\0\0") + tlv(0, b"")
+        frame = eth("6c:4c:bc:2a:3b:d0", 0x88CC, body, dst="01:80:c2:00:00:0e")
+        info = pf.parse_discovery(frame)
+        self.assertEqual((info["proto"], info["ip"], info["platform"]), ("LLDP", "172.20.1.9", "TP-LINK CPE710 v1.0"))
+
+    def test_other_frames_ignored(self):
+        self.assertIsNone(pf.parse_discovery(eth("50:c7:bf:01:02:03", 0x0800, b"\0" * 40)))
+
+    def test_ip_conflict_flagged(self):
+        pf.DEVICES.clear()
+        pf.upsert(mac="cc:32:e5:9d:a9:a4", ip="192.168.0.254")
+        pf.upsert(mac="6c:4c:bc:2a:3b:d0", ip="192.168.0.254")
+        self.assertIn(("192.168.0.254", "6c:4c:bc:2a:3b:d0"), pf.CONFLICTS)
+
+
+class PcapTests(unittest.TestCase):
+    def test_stream(self):
+        import io
+        head = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+        rec = struct.pack("<IIII", 0, 0, len(CPE510_CDP), len(CPE510_CDP)) + CPE510_CDP
+        self.assertEqual(list(pf.iter_pcap(io.BytesIO(head + rec + rec))), [CPE510_CDP, CPE510_CDP])
+
+
 class SshTests(unittest.TestCase):
     def test_command(self):
         cmd = pf.ssh_command("192.168.0.254", "admin")

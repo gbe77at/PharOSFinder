@@ -11,6 +11,7 @@ struct DetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
+                if device.conflict == true { conflictCard }
                 if device.isOutOfRange { outOfRangeCard }
                 actions
                 GroupBox {
@@ -54,6 +55,19 @@ struct DetailView: View {
                 }
             }
         }
+    }
+
+    // MARK: Conflit d'adresse
+
+    private var conflictCard: some View {
+        Label("Un autre équipement utilise aussi \(device.ip ?? "cette IP"). Débranche l'un des deux ou change son adresse, sinon les connexions iront au hasard vers l'un ou l'autre.",
+              systemImage: "exclamationmark.2")
+            .font(.callout)
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     // MARK: Hors plage
@@ -142,6 +156,9 @@ struct DetailView: View {
             infoRow("Ports ouverts", device.ports.isEmpty ? "aucun détecté" : device.ports.map { String($0) }.joined(separator: ", "))
             infoRow("SSH", device.ssh ?? "—", mono: true)
             infoRow("Serveur web", device.server ?? "—")
+            if let fw = device.firmware {
+                infoRow("Firmware", fw)
+            }
             infoRow("Trouvé par", device.sources.joined(separator: ", "))
             if device.tdp {
                 infoRow("TDP", "trafic de découverte Pharos (UDP 20002) observé")

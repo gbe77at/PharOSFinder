@@ -38,8 +38,10 @@ struct ServiceBadges: View {
                 Badge(text: p == 22 ? "SSH" : p == 80 ? "HTTP" : p == 443 ? "HTTPS" : "\(p)", color: .secondary)
             }
             if device.tdp { Badge(text: "TDP", color: .teal) }
+            if let a = device.announced { Badge(text: a, color: .blue) }
+            if device.conflict == true { Badge(text: "conflit IP", color: .red) }
             if device.isOutOfRange { Badge(text: "hors plage", color: .orange) }
-            if device.ports.isEmpty && !device.tdp && !device.isOutOfRange {
+            if device.ports.isEmpty && !device.tdp && !device.isOutOfRange && device.announced == nil {
                 Text("—").foregroundStyle(.tertiary)
             }
         }

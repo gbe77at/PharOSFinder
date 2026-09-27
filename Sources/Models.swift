@@ -58,6 +58,9 @@ struct Device: Decodable, Identifiable, Hashable {
     var inRange: Bool
     var ipv6: String?
     var webLocal: String?
+    var firmware: String?
+    var announced: String?
+    var conflict: Bool?
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }
