@@ -39,7 +39,7 @@ done
 lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/PharosFinder"
 
 say "Ressources"
-cp Resources/pharos_finder.py "$APP/Contents/Resources/"
+cp Resources/pharos_finder.py Resources/finder_vendors.py "$APP/Contents/Resources/"
 iconutil -c icns Resources/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST

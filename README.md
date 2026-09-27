@@ -1,6 +1,6 @@
 # Pharos Finder — macOS et Windows
 
-Découverte réseau : **TP-Link PharOS** (CPE510, CPE710…), **Tuya / Smart Life** et **Amazon** (Echo, Fire TV), plus tout appareil annoncé en Bonjour/mDNS.
+Découverte et gestion réseau : **TP-Link PharOS** (CPE510, CPE710…), **UniFi**, **NETGEAR**, **QNAP**, **Tuya / Smart Life** et **Amazon** (Echo, Fire TV), plus tout appareil annoncé en Bonjour/mDNS.
 
 App native (SwiftUI) pour découvrir les équipements **TP-Link PharOS** (CPE510, CPE710 et les autres CPE/WBS), les rendre joignables et ouvrir leur configuration. Inspirée de Pharos Control et de QNAP Finder.
 
@@ -60,6 +60,10 @@ Un Pharos neuf ou réinitialisé est en **192.168.0.254** sans DHCP. Depuis le W
 | PharOS | annonces CDP/LLDP (IP, modèle, firmware, toutes les 60 s), page web, SSH, fabricant |
 | Tuya / Smart Life | annonces UDP 6666 (v3.1), 6667 (v3.3/3.4, AES-ECB), 7000 (v3.5, AES-GCM) : ID, productKey, version ; fabricant |
 | Amazon | fabricant, puis Fire TV (`_amzn-wplay`, port 5555) ou Echo (ports 55442/55443/4070, Spotify Connect) |
+| UniFi | découverte UDP 10001 (modèle, nom, firmware, état d'usine) ; avec le contrôleur : localiser, redémarrer, mettre à jour, adopter |
+| NETGEAR | NSDP UDP 63322/63324 (modèle, nom, IP, DHCP, firmware) ; lecture seule |
+| QNAP | `authLogin.cgi` (modèle, QTS, build, nom) |
+| Tuya (compte) | noms, types (passerelle, prise, capteur…), capteurs Zigbee/BLE par passerelle, firmware et mise à jour ; aide intégrée (bouton **Comptes**) |
 | Autres | nom Bonjour/mDNS (AirPlay, Chromecast, imprimantes…) |
 
 ## Limites

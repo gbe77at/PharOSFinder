@@ -7,6 +7,9 @@ extension Device {
         case "tplink": return .teal
         case "tuya": return .orange
         case "amazon": return .indigo
+        case "unifi": return .cyan
+        case "netgear": return .purple
+        case "qnap": return .mint
         default: return .gray
         }
     }
@@ -43,6 +46,8 @@ struct ServiceBadges: View {
             if let a = device.announced { Badge(text: a, color: .blue) }
             if let v = device.tuya?.version { Badge(text: "Tuya v\(v)", color: .orange) }
             if device.conflict == true { Badge(text: "conflit IP", color: .red) }
+            if device.updateAvailable == true { Badge(text: "MAJ dispo", color: .green) }
+            if let p = device.tuya?.parent { Badge(text: "via \(p)", color: .secondary) }
             if device.isOutOfRange { Badge(text: "hors plage", color: .orange) }
             if device.ports.isEmpty && !device.tdp && !device.isOutOfRange && device.announced == nil && device.tuya == nil {
                 Text("—").foregroundStyle(.tertiary)

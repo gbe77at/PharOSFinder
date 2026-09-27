@@ -23,6 +23,8 @@ final class Engine: ObservableObject {
     @Published var fullSweep = false
     @Published var extraRanges = ""
     @Published var listenSeconds = 180
+    @Published var help: [String: String] = [:]
+    private var accountsSent = false
 
     let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("PharosFinder-moteur.log")
 
@@ -77,6 +79,7 @@ final class Engine: ObservableObject {
     }
 
     func restart() {
+        accountsSent = false
         shutdown()
         pollTask = nil
         snapshot = nil
@@ -147,6 +150,12 @@ final class Engine: ObservableObject {
         if let s = snap {
             snapshot = s
             if status != .running(admin: s.root) { status = .running(admin: s.root) }
+            if !accountsSent {  // les identifiants vivent dans le trousseau : on les confie au moteur
+                accountsSent = true
+                for vendor in ["tuya", "unifi"] {
+                    if let f = AccountStore.load(vendor) { configureAccount(vendor, f) }
+                }
+            }
             // Choix automatique tant que l'utilisateur n'a rien choisi : un câble branché après le
             // lancement (Ethernet) passe devant le Wi-Fi.
             let best = Engine.pickDefault(s.interfaces)
@@ -210,6 +219,24 @@ final class Engine: ObservableObject {
         }
     }
 
+    func configureAccount(_ vendor: String, _ fields: [String: String]) {
+        var body: [String: Any] = fields
+        body["vendor"] = vendor
+        post("account", body)
+    }
+
+    func loadHelp() {
+        guard help.isEmpty, port != 0, let url = URL(string: "http://127.0.0.1:\(port)/api/help") else { return }
+        var req = URLRequest(url: url)
+        req.setValue(token, forHTTPHeaderField: "X-Token")
+        let request = req
+        Task.detached { [weak self] in
+            guard let self = self, let (data, _) = try? await self.session.data(for: request),
+                  let h = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+            await MainActor.run { self.help = h }
+        }
+    }
+
     func scan() {
         guard !selectedIface.isEmpty else { return }
         post("scan", ["iface": selectedIface, "factory": factory, "full": fullSweep, "extra": extraRanges])
@@ -231,9 +258,13 @@ final class Engine: ObservableObject {
                        "iface": device.iface ?? selectedIface])
     }
 
+    func action(_ d: Device, _ id: String) { post("action", ["id": d.id, "action": id]) }
+
     func openWeb(_ d: Device, https: Bool) {
         // IPv4 inconnue : le moteur relaie l'interface web via IPv6 sur 127.0.0.1.
-        let target = d.ip.map { "\(https ? "https" : "http")://\($0)/" } ?? d.webLocal
+        // QNAP & co : l'adresse exacte (port 8080…) vient du moteur.
+        let known = https && d.webLocal == nil ? d.web.flatMap { $0.hasPrefix("http") ? $0 : nil } : nil
+        let target = known ?? d.ip.map { "\(https ? "https" : "http")://\($0)/" } ?? d.webLocal
         guard let t = target, let url = URL(string: t) else { return }
         NSWorkspace.shared.open(url)
     }

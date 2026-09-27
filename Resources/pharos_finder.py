@@ -40,6 +40,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import finder_vendors as fv  # noqa: E402  (protocoles UniFi, NETGEAR, QNAP, Tuya cloud)
+
 VERSION = "1.0"
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = os.name == "nt"
@@ -679,10 +682,11 @@ def _new_device(key, mac, ip):
             "ssh": None, "sources": [], "tdp": False, "pharos_hint": False,
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
-            "announced": None, "name": None, "services": [], "tuya": None}
+            "announced": None, "name": None, "services": [], "tuya": None, "unifi": None,
+            "netgear": None, "qnap": None, "fw_modules": [], "update_available": False}
 
 
-KINDS = ("pharos", "tplink", "tuya", "amazon", "other")   # ordre d'affichage
+KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "tuya", "amazon", "other")   # ordre d'affichage
 
 
 def classify(d):
@@ -692,6 +696,12 @@ def classify(d):
         d["kind"] = "pharos"
     elif d.get("tuya") or "tuya" in vendor:
         d["kind"] = "tuya"
+    elif d.get("unifi") or "ubiquiti" in vendor:
+        d["kind"] = "unifi"
+    elif d.get("netgear") or "netgear" in vendor:
+        d["kind"] = "netgear"
+    elif d.get("qnap") or "qnap" in vendor or "_qdiscover._tcp" in (d.get("services") or []):
+        d["kind"] = "qnap"
     elif "amazon" in vendor or any(sv.startswith("_amzn") for sv in d.get("services") or []):
         d["kind"] = "amazon"
     elif d.get("vendor") == "TP-Link" or d.get("tplink_hint") or d.get("tdp") or "tp-link" in text:
@@ -774,6 +784,8 @@ def fingerprint(dev_id):
         info["vendor"] = vendor
     if not ip4 and web:
         info["web_local"] = ensure_tunnel(dev_id, ip, 443 if 443 in open_ports else 80)
+    if ip4 and vendor and "qnap" in vendor.lower():
+        threading.Thread(target=probe_qnap, args=(dev_id,), daemon=True).start()
     d = upsert(mac=mac, ip=ip4, **info)
     if d:
         label = {"pharos": "PharOS", "tplink": "TP-Link"}.get(d["kind"], "équipement")
@@ -916,6 +928,357 @@ def job_vlan_probe(iface_name, target, vlans):
         _vlan_destroy(name)
     log(f"Aucun des VLAN testés ne donne accès à {target}. Si tu connais le numéro, indique-le ; "
         "sinon le contrôle d'accès PharOS bloque la gestion et seul un reset la rendra.", "warn")
+
+
+# ─────────────────── UniFi, NETGEAR, QNAP : découverte locale ───────────────────
+
+def _ifindex(iface):
+    if IS_MAC and hasattr(socket, "if_nametoindex"):
+        try:
+            return socket.if_nametoindex(iface["name"])
+        except OSError:
+            return None
+    return None
+
+
+def _bind_ip(iface):
+    # Windows envoie le broadcast par l'interface de l'adresse liée ; ailleurs on lie à toutes.
+    if IS_WIN and iface["ipv4"]:
+        return iface["ipv4"][0]["ip"]
+    return ""
+
+
+def discover_vendors(iface):
+    """Découverte constructeur sans identifiants : UniFi (UDP 10001), NETGEAR (NSDP)."""
+    name, idx, bind = iface["name"], _ifindex(iface), _bind_ip(iface)
+    log(f"Découverte UniFi et NETGEAR sur {name}…")
+    n = 0
+    try:
+        for u in fv.ubnt_discover(wait=2.5, bind_ip=bind, ifindex=idx):
+            ip = u["ips"][0] if u["ips"] else u.get("sender")
+            label = fv.ubnt_model_label(u)
+            d = upsert(mac=u["mac"], ip=ip, source="UniFi", iface=name, model=label, firmware=u["firmware"],
+                       name=u["hostname"], vendor="Ubiquiti",
+                       unifi={"platform": u["platform"], "essid": u["essid"], "serial": u["serial"],
+                              "default": u["is_default"]})
+            if d:
+                n += 1
+                state = " · non adopté (réglages d'usine)" if u["is_default"] else ""
+                log(f"UniFi : {label} « {u['hostname'] or '?'} » en {ip}, firmware {u['firmware'] or '?'}{state}",
+                    "ok")
+    except OSError as e:
+        log(f"Découverte UniFi impossible : {e}", "warn")
+    try:
+        host_mac = bytes(int(x, 16) for x in (iface["mac"] or "00:00:00:00:00:00").split(":"))
+        for g in fv.nsdp_discover(host_mac, wait=2.5, bind_ip=bind, ifindex=idx):
+            d = upsert(mac=g["mac"], ip=g["ip"], source="NSDP", iface=name, model=g["model"], vendor="NETGEAR",
+                       name=g["name"], firmware=g["firmware"],
+                       netgear={"dhcp": g["dhcp"], "firmware2": g["firmware2"], "location": g["location"],
+                                "gateway": g["gateway"], "active_slot": g["active_slot"]})
+            if d:
+                n += 1
+                log(f"NETGEAR : {g['model'] or '?'} « {g['name'] or '?'} » en {g['ip']}, firmware "
+                    f"{g['firmware'] or '?'}", "ok")
+    except OSError as e:
+        log(f"Découverte NETGEAR impossible : {e}", "warn")
+    if not n:
+        log("Aucun équipement UniFi ou NETGEAR ne s'est annoncé.")
+
+
+def probe_qnap(dev_id):
+    with LOCK:
+        d = DEVICES.get(dev_id)
+        ip = d["ip"] if d else None
+    info = fv.qnap_probe(ip) if ip else None
+    if info:
+        upsert(mac=d["mac"], ip=ip, source="QNAP", model=info["model"], vendor="QNAP",
+               firmware=" ".join(filter(None, [info["firmware"], f"build {info['build']}" if info["build"] else None])),
+               name=info["hostname"], web=info["web"], qnap=info)
+        log(f"QNAP : {info['model']} « {info['hostname'] or '?'} » en {ip}, QTS {info['firmware'] or '?'}", "ok")
+
+
+# ─────────────────── Comptes : Tuya cloud, contrôleur UniFi ───────────────────
+
+INTEGRATIONS = {"tuya": {"configured": False, "status": "non configuré", "last_sync": None},
+                "unifi": {"configured": False, "status": "non configuré", "last_sync": None}}
+_CLIENTS = {}   # vendor -> client (identifiants en mémoire seulement, sauf « mémoriser »)
+CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                           "PharosFinder" if IS_WIN else ".pharosfinder", "comptes.json")
+
+
+def _status(vendor, status, ok=None):
+    INTEGRATIONS[vendor]["status"] = status
+    if ok is not None:
+        INTEGRATIONS[vendor]["ok"] = ok
+
+
+def configure_account(vendor, b, persist=False):
+    if vendor == "tuya":
+        if not b.get("access_id") or not b.get("access_secret"):
+            raise RuntimeError("Access ID et Access Secret requis")
+        _CLIENTS["tuya"] = fv.TuyaCloud(b["access_id"], b["access_secret"], b.get("region") or "eu")
+    elif vendor == "unifi":
+        if not b.get("url") or not b.get("username"):
+            raise RuntimeError("adresse du contrôleur et identifiant requis")
+        _CLIENTS["unifi"] = fv.UniFiController(b["url"], b["username"], b.get("password", ""), b.get("site"))
+    else:
+        raise RuntimeError("compte inconnu")
+    INTEGRATIONS[vendor].update(configured=True, status="configuré, pas encore synchronisé")
+    if persist:
+        save_accounts(vendor, b)
+    log(f"Compte {vendor} configuré.", "ok")
+
+
+def forget_account(vendor):
+    _CLIENTS.pop(vendor, None)
+    INTEGRATIONS[vendor] = {"configured": False, "status": "non configuré", "last_sync": None}
+    save_accounts(vendor, None)
+    log(f"Compte {vendor} oublié.")
+
+
+def save_accounts(vendor, data):
+    try:
+        cfg = json.load(open(CONFIG_PATH, encoding="utf-8")) if os.path.exists(CONFIG_PATH) else {}
+    except (OSError, ValueError):
+        cfg = {}
+    if data is None:
+        cfg.pop(vendor, None)
+    else:
+        cfg[vendor] = {k: v for k, v in data.items() if k != "persist"}
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+
+
+def load_accounts():
+    try:
+        cfg = json.load(open(CONFIG_PATH, encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for vendor, data in cfg.items():
+        try:
+            configure_account(vendor, data)
+        except Exception as e:  # noqa: BLE001
+            log(f"Compte {vendor} mémorisé illisible : {e}", "warn")
+
+
+def _tuya_find(dev_id, ip):
+    with LOCK:
+        for d in DEVICES.values():
+            if (d.get("tuya") or {}).get("gw_id") == dev_id:
+                return d
+        if ip:
+            for d in DEVICES.values():
+                if d["ip"] == ip and d["kind"] in ("tuya", "other"):
+                    return d
+    return None
+
+
+def _tuya_apply(cd, parent=None):
+    """Fiche cloud Tuya → équipement de la liste (fusion avec l'annonce locale si elle existe)."""
+    cat = fv.tuya_category_label(cd.get("category"))
+    info = {"gw_id": cd.get("id"), "product_key": cd.get("product_id"), "category": cd.get("category"),
+            "product_name": cd.get("product_name"), "online": cd.get("online", cd.get("is_online")),
+            "sub": bool(cd.get("sub")) or parent is not None, "parent": parent,
+            "gateway": cd.get("category") in ("wg2", "wg", "wfcon")}
+    local = _tuya_find(cd.get("id"), None)
+    if local:
+        info["version"] = (local.get("tuya") or {}).get("version")
+        with LOCK:
+            local["tuya"] = dict(local.get("tuya") or {}, **info)
+        d = upsert(mac=local["mac"], ip=local["ip"], source="Tuya cloud", name=cd.get("name"), model=cat,
+                   title=cd.get("product_name"))
+    elif info["sub"]:
+        # Capteur Zigbee / BLE : pas d'IP, rattaché à sa passerelle.
+        key = f"tuya:{cd.get('id')}"
+        with LOCK:
+            d = DEVICES.get(key) or _new_device(key, None, None)
+            DEVICES[key] = d
+            d.update(name=cd.get("name"), model=cat, title=cd.get("product_name"), vendor="Tuya",
+                     tuya=info, last_seen=time.strftime("%H:%M:%S"))
+            if "Tuya cloud" not in d["sources"]:
+                d["sources"].append("Tuya cloud")
+            classify(d)
+    else:
+        d = None   # appareil Wi-Fi non vu sur ce réseau : on ne l'ajoute pas (il est ailleurs)
+    return d
+
+
+def job_tuya_sync():
+    c = _CLIENTS.get("tuya")
+    if not c:
+        raise RuntimeError("compte Tuya non configuré (bouton « Comptes »)")
+    _status("tuya", "synchronisation…")
+    try:
+        devices = c.devices()
+    except Exception as e:  # noqa: BLE001
+        _status("tuya", f"erreur : {e}", False)
+        raise RuntimeError(f"Tuya : {e}. Vérifie l'aide « Comptes » (projet, région, compte Smart Life lié).")
+    log(f"Tuya cloud : {len(devices)} appareil(s) sur le compte.", "ok")
+    matched = 0
+    for cd in devices:
+        d = _tuya_apply(cd)
+        if d:
+            matched += 1
+        if cd.get("category") in ("wg2", "wg", "wfcon"):
+            try:
+                for sub in c.sub_devices(cd["id"]):
+                    _tuya_apply(sub, parent=cd.get("name") or cd["id"])
+            except Exception as e:  # noqa: BLE001
+                log(f"Sous-appareils de {cd.get('name')} illisibles : {e}", "warn")
+    # Firmware : un appel par appareil visible.
+    with LOCK:
+        targets = [d for d in DEVICES.values() if (d.get("tuya") or {}).get("gw_id")]
+    for d in targets:
+        try:
+            mods = c.firmware(d["tuya"]["gw_id"])
+        except Exception as e:  # noqa: BLE001
+            log(f"Firmware de {d.get('name') or d['tuya']['gw_id']} illisible : {e}", "warn")
+            continue
+        fw = [{"module": m.get("type_desc") or f"module {m.get('type')}", "channel": m.get("type"),
+               "current": m.get("current_version"), "latest": m.get("version"),
+               "can_upgrade": bool(m.get("can_upgrade")) or m.get("upgrade_status") == 1,
+               "status": m.get("upgrade_status")} for m in mods]
+        with LOCK:
+            d["fw_modules"] = fw
+            d["firmware"] = ", ".join(f"{m['module']} {m['current']}" for m in fw if m["current"]) or d["firmware"]
+            d["update_available"] = any(m["can_upgrade"] and m["latest"] and m["latest"] != m["current"] for m in fw)
+        time.sleep(0.2)
+    INTEGRATIONS["tuya"]["last_sync"] = time.strftime("%H:%M:%S")
+    _status("tuya", f"synchronisé ({len(devices)} appareils, {matched} vus sur ce réseau)", True)
+    log("Synchronisation Tuya terminée.", "ok")
+
+
+def job_unifi_sync():
+    c = _CLIENTS.get("unifi")
+    if not c:
+        raise RuntimeError("contrôleur UniFi non configuré (bouton « Comptes »)")
+    _status("unifi", "synchronisation…")
+    try:
+        devs = c.devices()
+    except Exception as e:  # noqa: BLE001
+        _status("unifi", f"erreur : {e}", False)
+        raise RuntimeError(f"contrôleur UniFi : {e}")
+    for u in devs:
+        mac = norm_mac(u.get("mac") or "")
+        latest = u.get("upgrade_to_firmware") or (u.get("version") if not u.get("upgradable") else None)
+        d = upsert(mac=mac, ip=u.get("ip"), source="contrôleur UniFi", vendor="Ubiquiti",
+                   name=u.get("name"), model=u.get("model_name") or u.get("model"), firmware=u.get("version"),
+                   unifi={"adopted": u.get("adopted"), "state": u.get("state"), "type": u.get("type"),
+                          "controller": True, "upgradable": bool(u.get("upgradable")), "latest": latest})
+        if d:
+            with LOCK:
+                d["update_available"] = bool(u.get("upgradable"))
+    INTEGRATIONS["unifi"]["last_sync"] = time.strftime("%H:%M:%S")
+    _status("unifi", f"synchronisé ({len(devs)} équipements)", True)
+    log(f"Contrôleur UniFi : {len(devs)} équipement(s).", "ok")
+
+
+# ─────────────────── actions par équipement ───────────────────
+
+def device_actions(d):
+    """Actions proposées dans les interfaces : [{id, label, confirm?}]."""
+    acts = []
+    if d.get("web") or (d["kind"] in ("netgear", "qnap", "unifi", "tplink", "pharos") and d["ip"]):
+        acts.append({"id": "web", "label": "Ouvrir l'interface web"})
+    u = d.get("unifi") or {}
+    if u.get("controller") and d["mac"]:
+        acts += [{"id": "unifi:set-locate", "label": "Faire clignoter (localiser)"},
+                 {"id": "unifi:unset-locate", "label": "Arrêter le clignotement"},
+                 {"id": "unifi:restart", "label": "Redémarrer", "confirm": "Redémarrer cet équipement UniFi ?"}]
+        if u.get("upgradable"):
+            acts.append({"id": "unifi:upgrade", "label": f"Mettre à jour le firmware ({u.get('latest') or 'dernière'})",
+                         "confirm": "Lancer la mise à jour du firmware ? L'équipement redémarrera."})
+        if u.get("adopted") is False:
+            acts.append({"id": "unifi:adopt", "label": "Adopter dans le contrôleur"})
+    for m in d.get("fw_modules") or []:
+        if m["can_upgrade"] and m["latest"] and m["latest"] != m["current"]:
+            acts.append({"id": f"tuya:upgrade:{m['channel']}",
+                         "label": f"Mettre à jour {m['module']} ({m['current']} → {m['latest']})",
+                         "confirm": "Lancer la mise à jour Tuya ? L'appareil sera indisponible quelques minutes."})
+    return acts
+
+
+def run_action(dev_id, action):
+    with LOCK:
+        d = DEVICES.get(dev_id)
+    if not d:
+        raise RuntimeError("équipement inconnu")
+    if action.startswith("unifi:"):
+        c = _CLIENTS.get("unifi")
+        if not c:
+            raise RuntimeError("contrôleur UniFi non configuré")
+        cmd = action.split(":", 1)[1]
+        c.command(d["mac"], cmd)
+        log(f"UniFi : « {cmd} » envoyé à {d.get('name') or d['mac']}.", "ok")
+    elif action.startswith("tuya:upgrade:"):
+        c = _CLIENTS.get("tuya")
+        if not c:
+            raise RuntimeError("compte Tuya non configuré")
+        c.upgrade(d["tuya"]["gw_id"], action.rsplit(":", 1)[1])
+        log(f"Tuya : mise à jour lancée pour {d.get('name') or d['tuya']['gw_id']}.", "ok")
+    else:
+        raise RuntimeError("action inconnue")
+
+
+# ─────────────────── aide ───────────────────
+
+HELP = {
+    "tuya": """## Relier ton compte Tuya / Smart Life
+
+Pharos Finder lit tes appareils via l'API officielle Tuya (comme Home Assistant ou tinytuya). \
+Il te faut un projet développeur gratuit, relié à ton application Smart Life. Compte 10 minutes, une seule fois.
+
+**1. Crée un compte développeur**
+Va sur **platform.tuya.com** et inscris-toi (gratuit). Tu peux utiliser la même adresse e-mail que Smart Life.
+
+**2. Crée un projet cloud**
+Menu **Cloud → Development → Create Cloud Project** :
+- *Project Name* : ce que tu veux (ex. « Maison »)
+- *Industry* : **Smart Home** · *Development Method* : **Smart Home**
+- *Data Center* : **Central Europe Data Center** si ton compte Smart Life est français. \
+Il doit être le même que celui de ton compte Smart Life, sinon aucun appareil n'apparaîtra.
+
+À l'écran suivant, garde les services proposés (au minimum **IoT Core** et **Authorization Token Management**) et valide.
+
+**3. Relie ton application Smart Life**
+Dans le projet : onglet **Devices → Link App Account → Add App Account**. Un QR code s'affiche.
+Sur ton téléphone, dans Smart Life : **Moi** → icône de scan en haut à droite → scanne le QR code → confirme.
+Tes appareils apparaissent alors dans l'onglet *Devices* du projet.
+
+**4. Copie les clés**
+Onglet **Overview** du projet : copie **Access ID/Client ID** et **Access Secret/Client Secret**.
+
+**5. Dans Pharos Finder**
+Bouton **Comptes** → Tuya : colle les deux clés, choisis la région **Europe** (celle du point 2), puis **Enregistrer et synchroniser**.
+
+**Ce que tu obtiens** : le nom de chaque appareil, son type (passerelle Zigbee, prise, capteur…), \
+les capteurs Zigbee/Bluetooth rattachés à chaque passerelle, les versions de firmware et, quand Tuya le permet, un bouton de mise à jour.
+
+**En cas de problème**
+- *« permission deny » ou « No permissions »* : dans le projet, onglet **Service API**, vérifie que **IoT Core** est activé.
+- *Aucun appareil* : mauvaise région (point 2) ou compte Smart Life non relié (point 3).
+- *« trial edition expired »* : le service IoT Core gratuit se prolonge tous les 6 mois : \
+**Cloud → Cloud Services → IoT Core → Extend Trial Period** (gratuit).
+- Les clés restent sur ton ordinateur (trousseau macOS, ou fichier protégé si tu coches « mémoriser » sur PC) \
+et ne sont envoyées qu'au cloud Tuya.
+""",
+    "unifi": """## Relier ton contrôleur UniFi
+
+Pharos Finder pilote tes équipements UniFi via ton contrôleur **UniFi Network** (console UniFi OS : \
+UDM, Cloud Key, UniFi OS Server ; ou application Network installée sur un ordinateur).
+
+1. Dans UniFi, crée de préférence un **administrateur local** dédié (*Paramètres → Administrateurs → Ajouter*, \
+« Accès restreint aux administrateurs locaux »). Les comptes Ubiquiti avec double authentification ne fonctionnent pas en local.
+2. Dans Pharos Finder : **Comptes → UniFi** : adresse du contrôleur (ex. `https://10.10.10.1` pour une console, \
+`https://10.10.10.50:8443` pour l'application Network), identifiant, mot de passe, site (`default` en général).
+3. **Enregistrer et synchroniser**.
+
+Tu peux alors : faire clignoter un équipement pour le localiser, le redémarrer, lancer sa mise à jour de firmware, \
+et adopter un équipement neuf.
+""",
+}
 
 
 TUNNELS = {}   # id équipement -> {"port", "target"}
@@ -1090,6 +1453,14 @@ def job_scan(iface_name, factory, full, extra):
         fingerprint_many(list(dict.fromkeys(found_ids)))
     if not JOBS.get("scan", {}).get("stop"):
         discover_mdns(iface)
+    if not JOBS.get("scan", {}).get("stop"):
+        discover_vendors(iface)
+    for vendor, job in (("tuya", job_tuya_sync), ("unifi", job_unifi_sync)):
+        if vendor in _CLIENTS and not JOBS.get("scan", {}).get("stop"):
+            try:
+                job()
+            except Exception as e:  # noqa: BLE001
+                log(str(e), "warn")
     if not JOBS.get("scan", {}).get("stop"):
         discover_ipv6(iface)
     log("Recherche terminée.", "ok")
@@ -1337,7 +1708,7 @@ def tuya_listener():
 MDNS_SERVICES = ("_amzn-wplay._tcp", "_amzn-alexa._tcp", "_spotify-connect._tcp", "_googlecast._tcp",
                  "_airplay._tcp", "_raop._tcp", "_hap._tcp", "_companion-link._tcp", "_http._tcp",
                  "_ipp._tcp", "_printer._tcp", "_smb._tcp", "_device-info._tcp", "_matter._tcp",
-                 "_sonos._tcp", "_workstation._tcp")
+                 "_sonos._tcp", "_workstation._tcp", "_qdiscover._tcp")
 
 
 def _dns_name(msg, p):
@@ -1948,6 +2319,7 @@ def snapshot():
         devs = []
         for d in DEVICES.values():
             c = dict(d)
+            c["actions"] = device_actions(d)
             c["conflict"] = bool(d["ip"]) and any(o is not d and o["ip"] == d["ip"] and o["mac"]
                                                   for o in DEVICES.values())
             c["in_range"] = bool(d["ip"]) and not d["ip"].startswith("169.254.") and \
@@ -1960,6 +2332,7 @@ def snapshot():
             "interfaces": ifaces, "devices": devs, "log": LOG[-200:],
             "jobs": {k: {"label": v["label"], "elapsed": int(time.time() - v["started"])} for k, v in JOBS.items()},
             "aliases": list(ALIASES),
+            "integrations": {k: dict(v) for k, v in INTEGRATIONS.items()},
         }
 
 
@@ -1989,6 +2362,10 @@ class Handler(BaseHTTPRequestHandler):
             if parse_qs(u.query).get("t", [""])[0] != TOKEN:
                 return self._send(403, b"Lien invalide : utilise l'URL affichee au lancement.", "text/plain")
             return self._send(200, UI_HTML.encode(), "text/html")
+        if u.path == "/api/help":
+            if not self._authorized():
+                return self._send(403, {"error": "jeton invalide"})
+            return self._send(200, HELP)
         if u.path == "/api/state":
             if not self._authorized():
                 return self._send(403, {"error": "jeton invalide"})
@@ -2023,6 +2400,17 @@ class Handler(BaseHTTPRequestHandler):
                         j["proc"].terminate()
         elif path == "/api/reach":
             start_job("reach", "Rendre joignable", job_reach, b["id"], b.get("iface"), int(b.get("prefix", 24)))
+        elif path == "/api/account":
+            configure_account(b.get("vendor"), b, persist=bool(b.get("persist")))
+            start_job(f"{b['vendor']}_sync", f"Synchronisation {b['vendor']}",
+                      job_tuya_sync if b["vendor"] == "tuya" else job_unifi_sync)
+        elif path == "/api/account/forget":
+            forget_account(b.get("vendor"))
+        elif path == "/api/sync":
+            v = b.get("vendor")
+            start_job(f"{v}_sync", f"Synchronisation {v}", job_tuya_sync if v == "tuya" else job_unifi_sync)
+        elif path == "/api/action":
+            start_job("action", "Action", run_action, b["id"], b["action"])
         elif path == "/api/vlan":
             vl = [int(v) for v in re.split(r"[,\s]+", str(b.get("vlans", ""))) if v.strip()] or COMMON_VLANS
             vl = [v for v in vl if 1 <= v <= 4094][:64]
@@ -2149,6 +2537,7 @@ def main():
     atexit.register(cleanup_vlans)
     threading.Thread(target=announcement_sniffer, daemon=True).start()
     threading.Thread(target=tuya_listener, daemon=True).start()
+    load_accounts()
 
     def _sig(*_):
         cleanup_aliases()
@@ -2214,7 +2603,7 @@ header{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var
 .pill{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
 .pill.warn{color:var(--warn);border-color:currentColor}
 .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 16px;background:var(--panel2);border-bottom:1px solid var(--line)}
-select,input[type=text],input[type=number]{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+select,input[type=text],input[type=password],input[type=number]{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
 select{min-width:260px}
 label.chk{display:flex;align-items:center;gap:5px;color:var(--text);white-space:nowrap}
 button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:6px;padding:5px 12px;cursor:pointer;white-space:nowrap}
@@ -2235,7 +2624,16 @@ tr.row{cursor:pointer;background:var(--panel)}
 tr.row:hover{background:var(--panel2)}
 tr.row.sel{background:var(--sel)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--other)}
-.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)} .dot.tuya{background:#f97316} .dot.amazon{background:#6366f1}
+.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)} .dot.tuya{background:#f97316} .dot.amazon{background:#6366f1} .dot.unifi{background:#0ea5e9} .dot.netgear{background:#7c3aed} .dot.qnap{background:#0891b2}
+.tag.upd{color:var(--ok);border-color:currentColor}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:10}
+#modal .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:min(760px,94vw);max-height:90vh;overflow:auto;padding:18px}
+#modal .tabs{display:flex;gap:6px;margin-bottom:12px}
+#modal .tabs button.on{background:var(--sel);color:var(--accent);font-weight:600}
+#modal label{display:block;margin:8px 0 3px;color:var(--muted)}
+#modal input[type=text],#modal input[type=password],#modal select{width:100%}
+.help{border-top:1px solid var(--line);margin-top:14px;padding-top:6px;line-height:1.5}
+.help h2{font-size:15px}.help code{font-family:var(--mono);background:var(--panel2);padding:0 3px;border-radius:3px}
 .mono{font-family:var(--mono);font-size:12px}
 .tag{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;margin-right:3px;border:1px solid var(--line);color:var(--muted)}
 .tag.out{color:var(--warn);border-color:currentColor}
@@ -2285,6 +2683,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   </div>
   <div class="spacer"></div>
   <span class="pill" id="rootPill"></span>
+  <button id="btnAccounts" title="Relier Tuya / Smart Life et le contrôleur UniFi">Comptes</button>
   <button class="danger" id="btnQuit" title="Arrête le moteur et retire les adresses temporaires">Quitter</button>
 </header>
 
@@ -2299,7 +2698,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   <button class="danger" id="btnStop" disabled>Stop</button>
   <div class="spacer"></div>
   <div class="seg" id="filter">
-    <button data-f="all" class="on">Tous</button><button data-f="pharos">PharOS</button><button data-f="tplink">TP-Link</button><button data-f="tuya">Tuya</button><button data-f="amazon">Amazon</button>
+    <button data-f="all" class="on">Tous</button><button data-f="pharos">PharOS</button><button data-f="tplink">TP-Link</button><button data-f="unifi">UniFi</button><button data-f="netgear">NETGEAR</button><button data-f="qnap">QNAP</button><button data-f="tuya">Tuya</button><button data-f="amazon">Amazon</button>
   </div>
 </div>
 
@@ -2319,6 +2718,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   <div id="log"></div>
 </footer>
 <div id="toast"></div>
+<div id="modal"><div class="box" id="modalBox"></div></div>
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get('t');
@@ -2332,7 +2732,7 @@ async function api(path, body){
   if(!r.ok){ toast(j.error || 'Erreur'); throw new Error(j.error); }
   refresh(); return j;
 }
-const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
+const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', unifi:'UniFi', netgear:'NETGEAR', qnap:'QNAP', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
 function displayName(d){
   if(d.kind === 'pharos') return d.model || 'PharOS';
   return d.name || d.model || d.title || (d.kind === 'other' ? 'Équipement' : KIND_LABEL[d.kind]);
@@ -2386,6 +2786,8 @@ function render(){
       + (d.tdp ? '<span class="tag tdp">TDP</span>' : '')
       + (d.announced ? `<span class="tag tdp">${esc(d.announced)}</span>` : '')
       + (d.conflict ? '<span class="tag out" style="color:var(--err)">conflit IP</span>' : '')
+      + (d.update_available ? '<span class="tag upd">MAJ dispo</span>' : '')
+      + (d.tuya && d.tuya.parent ? `<span class="tag">via ${esc(d.tuya.parent)}</span>` : '')
       + (d.ip && !d.in_range ? '<span class="tag out">hors plage</span>' : '');
     return `<tr class="row ${d.id === selected ? 'sel' : ''}" data-id="${esc(d.id)}">
       <td><span class="dot ${d.kind}"></span>${esc(name)}</td>
@@ -2438,8 +2840,11 @@ function renderDetail(){
       <dt>SSH</dt><dd class="mono">${esc(d.ssh || '—')}</dd>
       <dt>Serveur web</dt><dd>${esc(d.server || '—')}</dd>
       ${d.firmware ? `<dt>Firmware</dt><dd>${esc(d.firmware)}</dd>` : ''}
+      ${(d.fw_modules||[]).map(m => `<dt>${esc(m.module)}</dt><dd>${esc(m.current||'?')}${m.latest && m.latest !== m.current ? ` → <b style="color:var(--ok)">${esc(m.latest)}</b>` : ' (à jour)'}</dd>`).join('')}
+      ${d.tuya && d.tuya.gateway ? `<dt>Capteurs</dt><dd>${S.devices.filter(x => x.tuya && x.tuya.parent === d.name).map(x => esc(x.name + ' (' + x.model + ')')).join('<br>') || 'aucun'}</dd>` : ''}
       <dt>Source</dt><dd>${esc(d.sources.join(', '))}</dd>
     </dl>
+    ${(d.actions||[]).filter(a => a.id !== 'web').length ? `<div class="actions">${d.actions.filter(a => a.id !== 'web').map(a => `<button data-vact="${esc(a.id)}" data-confirm="${esc(a.confirm||'')}" ${busy?'disabled':''}>${esc(a.label)}</button>`).join('')}</div>` : ''}
     <div class="actions">
       ${d.ip && !d.in_range ? `<button class="primary" data-act="reach" ${busy||!S.root?'disabled':''}>Rendre joignable (alias ${esc(guessNet)}x sur ${esc(d.iface || $('iface').value)})</button>` : ''}
       ${!d.ip && d.web_local ? `<button class="primary" data-act="weblocal">Ouvrir l'interface web (via IPv6)</button><p class="hint" style="margin:0">IPv4 inconnue : l'app relaie l'interface web par IPv6. Tu y liras son IP dans Network → LAN, sans reset.</p>` : ''}
@@ -2473,6 +2878,13 @@ document.addEventListener('click', async e => {
   if(rm){ const [iface, ip] = rm.dataset.rm.split('|'); return api('/api/alias/remove', {iface, ip}).catch(()=>{}); }
   const f = e.target.closest('#filter button');
   if(f){ filter = f.dataset.f; document.querySelectorAll('#filter button').forEach(b => b.classList.toggle('on', b === f)); render(); return; }
+  const va = e.target.closest('[data-vact]');
+  if(va){
+    if(va.dataset.confirm && !confirm(va.dataset.confirm)) return;
+    return api('/api/action', {id:selected, action:va.dataset.vact}).catch(()=>{});
+  }
+  const tab = e.target.closest('[data-acct]');
+  if(tab){ showAccounts(tab.dataset.acct); return; }
   const a = e.target.closest('[data-act]');
   if(!a) return;
   const d = S.devices.find(x => x.id === selected); if(!d) return;
@@ -2480,7 +2892,7 @@ document.addEventListener('click', async e => {
   try{
     if(act === 'reach') await api('/api/reach', {id:d.id, iface:d.iface || $('iface').value, prefix:24});
     // Ouvert par le navigateur lui-même : jamais par le moteur administrateur.
-    if(act === 'web') window.open(`https://${d.ip}/`, '_blank', 'noopener');
+    if(act === 'web') window.open(d.web && !d.web_local ? d.web : `https://${d.ip}/`, '_blank', 'noopener');
     if(act === 'webhttp') window.open(`http://${d.ip}/`, '_blank', 'noopener');
     if(act === 'weblocal') window.open(d.web_local, '_blank', 'noopener');
     if(act === 'ssh') await api('/api/ssh', {ip:d.ip || d.ipv6, user:($('sshUser')||{}).value || 'admin'});
@@ -2497,6 +2909,49 @@ $('iface').addEventListener('change', () => { ifaceTouched = true; });
 $('btnScan').onclick = () => api('/api/scan', {iface:$('iface').value, factory:$('factory').checked, full:$('full').checked, extra:$('extra').value}).catch(()=>{});
 $('btnListen').onclick = () => api('/api/listen', {iface:$('iface').value, seconds:+$('secs').value || 180}).catch(()=>{});
 $('btnStop').onclick = () => api('/api/stop').catch(()=>{});
+let HELP = null, acctTab = 'tuya';
+function md(t){  // mini Markdown pour l'aide : titres, gras, code, listes
+  return esc(t).split('\n\n').map(b => {
+    b = b.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\*(.+?)\*/g,'<i>$1</i>').replace(/`(.+?)`/g,'<code>$1</code>');
+    if(b.startsWith('## ')) return '<h2>' + b.slice(3) + '</h2>';
+    const lines = b.split('\n');
+    if(lines.every(l => /^(- |\d\. )/.test(l))) return '<ul>' + lines.map(l => '<li>' + l.replace(/^(- |\d\. )/,'') + '</li>').join('') + '</ul>';
+    return '<p>' + lines.map(l => l.replace(/^- /,'• ')).join('<br>') + '</p>';
+  }).join('');
+}
+async function showAccounts(tab){
+  acctTab = tab || acctTab;
+  if(!HELP){ try{ HELP = await (await fetch('/api/help', {headers:{'X-Token':TOKEN}})).json(); }catch(_){ HELP = {}; } }
+  const st = (S && S.integrations && S.integrations[acctTab]) || {};
+  const form = acctTab === 'tuya' ? `
+    <label>Access ID / Client ID</label><input type="text" id="aId" autocomplete="off">
+    <label>Access Secret / Client Secret</label><input type="password" id="aSecret" autocomplete="off">
+    <label>Région du projet (Data Center)</label><select id="aRegion"><option value="eu">Europe centrale</option><option value="weu">Europe de l'Ouest</option><option value="us">États-Unis (Ouest)</option><option value="eus">États-Unis (Est)</option><option value="cn">Chine</option><option value="in">Inde</option></select>` : `
+    <label>Adresse du contrôleur</label><input type="text" id="aUrl" placeholder="https://10.10.10.1">
+    <label>Identifiant (administrateur local)</label><input type="text" id="aUser" autocomplete="off">
+    <label>Mot de passe</label><input type="password" id="aPw" autocomplete="off">
+    <label>Site</label><input type="text" id="aSite" value="default">`;
+  $('modalBox').innerHTML = `
+    <div class="tabs"><button data-acct="tuya" class="${acctTab==='tuya'?'on':''}">Tuya / Smart Life</button><button data-acct="unifi" class="${acctTab==='unifi'?'on':''}">UniFi</button><div class="spacer"></div><button id="mClose">Fermer</button></div>
+    <p>État : <b>${esc(st.status || 'non configuré')}</b>${st.last_sync ? ' · dernière synchro ' + esc(st.last_sync) : ''}</p>
+    ${form}
+    <label class="chk" style="margin-top:10px"><input type="checkbox" id="aPersist"> Mémoriser sur cet ordinateur (fichier protégé)</label>
+    <div class="row2" style="margin-top:12px"><button class="primary" id="mSave">Enregistrer et synchroniser</button>
+      ${st.configured ? '<button id="mSync">Synchroniser</button><button class="danger" id="mForget">Oublier</button>' : ''}</div>
+    <div class="help">${md((HELP && HELP[acctTab]) || '')}</div>`;
+  $('modal').style.display = 'flex';
+  $('mClose').onclick = () => $('modal').style.display = 'none';
+  $('mSave').onclick = async () => {
+    const body = acctTab === 'tuya'
+      ? {vendor:'tuya', access_id:$('aId').value, access_secret:$('aSecret').value, region:$('aRegion').value}
+      : {vendor:'unifi', url:$('aUrl').value, username:$('aUser').value, password:$('aPw').value, site:$('aSite').value};
+    body.persist = $('aPersist').checked;
+    try{ await api('/api/account', body); $('modal').style.display = 'none'; }catch(_){}
+  };
+  if($('mSync')) $('mSync').onclick = () => api('/api/sync', {vendor:acctTab}).then(() => $('modal').style.display = 'none').catch(()=>{});
+  if($('mForget')) $('mForget').onclick = () => api('/api/account/forget', {vendor:acctTab}).then(() => showAccounts()).catch(()=>{});
+}
+$('btnAccounts').onclick = () => showAccounts();
 $('btnQuit').onclick = async () => {
   if(!confirm('Arrêter Pharos Finder ? Les adresses temporaires seront retirées.')) return;
   try{ await fetch('/api/quit', {method:'POST', headers:{'Content-Type':'application/json','X-Token':TOKEN}, body:'{}'}); }catch(_){}

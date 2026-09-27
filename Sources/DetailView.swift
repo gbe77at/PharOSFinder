@@ -6,6 +6,7 @@ struct DetailView: View {
     @State private var newIP = ""
     @State private var prefix = 24
     @State private var sshUser = "admin"
+    @State private var pendingAction: DeviceAction?
 
     var body: some View {
         ScrollView {
@@ -14,6 +15,22 @@ struct DetailView: View {
                 if device.conflict == true { conflictCard }
                 if device.isOutOfRange { outOfRangeCard }
                 actions
+                if let acts = device.actions?.filter({ $0.id != "web" }), !acts.isEmpty {
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(acts) { a in
+                                Button(a.label) {
+                                    if a.confirm != nil { pendingAction = a } else { engine.action(device, a.id) }
+                                }
+                                .disabled(engine.isBusy)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                    } label: {
+                        Label("Gestion", systemImage: "slider.horizontal.below.rectangle")
+                    }
+                }
                 GroupBox {
                     infoGrid.padding(8)
                 } label: {
@@ -30,6 +47,14 @@ struct DetailView: View {
             .padding(20)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .confirmationDialog(pendingAction?.confirm ?? "", isPresented: Binding(
+            get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } }), titleVisibility: .visible) {
+            Button(pendingAction?.label ?? "Confirmer") {
+                if let a = pendingAction { engine.action(device, a.id) }
+                pendingAction = nil
+            }
+            Button("Annuler", role: .cancel) { pendingAction = nil }
+        }
     }
 
     // MARK: En-tête
@@ -39,6 +64,9 @@ struct DetailView: View {
         case "pharos", "tplink": return "antenna.radiowaves.left.and.right"
         case "tuya": return "lightbulb.fill"
         case "amazon": return device.model == "Fire TV" ? "tv" : "hifispeaker.fill"
+        case "unifi": return "wifi.router"
+        case "netgear": return "rectangle.connected.to.line.below"
+        case "qnap": return "externaldrive.connected.to.line.below"
         default: return "network"
         }
     }
@@ -172,6 +200,14 @@ struct DetailView: View {
             infoRow("Serveur web", device.server ?? "—")
             if let fw = device.firmware {
                 infoRow("Firmware", fw)
+            }
+            ForEach(device.fwModules ?? [], id: \.self) { m in
+                infoRow(m.module, m.hasUpdate ? "\(m.current ?? "?") → \(m.latest ?? "?") (mise à jour disponible)"
+                                              : "\(m.current ?? "?") (à jour)")
+            }
+            if device.tuya?.gateway == true {
+                let subs = (engine.snapshot?.devices ?? []).filter { $0.tuya?.parent == device.name }
+                infoRow("Capteurs", subs.isEmpty ? "aucun" : subs.map { "\($0.displayName) (\($0.model ?? "?"))" }.joined(separator: "\n"))
             }
             if let t = device.tuya {
                 infoRow("ID Tuya", t.gwId ?? "—", mono: true)

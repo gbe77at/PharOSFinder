@@ -4,6 +4,9 @@ enum DeviceFilter: String, CaseIterable, Identifiable {
     case all = "Tous"
     case pharos = "PharOS"
     case tplink = "TP-Link"
+    case unifi = "UniFi"
+    case netgear = "NETGEAR"
+    case qnap = "QNAP"
     case tuya = "Tuya"
     case amazon = "Amazon"
     var id: String { rawValue }
@@ -16,6 +19,7 @@ struct ContentView: View {
     @State private var search = ""
     @State private var showOptions = false
     @State private var showLog = true
+    @State private var showAccounts = false
 
     private var allDevices: [Device] { engine.snapshot?.devices ?? [] }
 
@@ -27,6 +31,9 @@ struct ContentView: View {
                 case .tplink: return d.kind == "tplink" || d.kind == "pharos"
                 case .tuya: return d.kind == "tuya"
                 case .amazon: return d.kind == "amazon"
+                case .unifi: return d.kind == "unifi"
+                case .netgear: return d.kind == "netgear"
+                case .qnap: return d.kind == "qnap"
                 case .all: return true
                 }
             }
@@ -72,6 +79,9 @@ struct ContentView: View {
                 selection = allDevices.first(where: { $0.kind == "pharos" })?.id
             }
         }
+        .sheet(isPresented: $showAccounts) {
+            AccountsView().environmentObject(engine)
+        }
         .alert("Pharos Finder",
                isPresented: Binding(get: { engine.errorMessage != nil },
                                     set: { if !$0 { engine.errorMessage = nil } })) {
@@ -116,6 +126,11 @@ struct ContentView: View {
             .help("Arrête la recherche ou l'écoute en cours")
             .disabled(!engine.isBusy)
 
+            Button { showAccounts = true } label: {
+                Label("Comptes", systemImage: "person.badge.key")
+            }
+            .help("Relier Tuya / Smart Life et le contrôleur UniFi")
+
             Button { showOptions.toggle() } label: {
                 Label("Options", systemImage: "slider.horizontal.3")
             }
@@ -127,8 +142,8 @@ struct ContentView: View {
             Picker("Filtre", selection: $filter) {
                 ForEach(DeviceFilter.allCases) { Text($0.rawValue).tag($0) }
             }
-            .pickerStyle(.segmented)
-            .frame(width: 340)
+            .pickerStyle(.menu)
+            .frame(width: 150)
             .help("Filtrer la liste")
         }
     }

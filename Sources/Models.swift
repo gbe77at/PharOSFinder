@@ -10,6 +10,47 @@ struct Snapshot: Decodable {
     var log: [LogEntry]
     var jobs: [String: Job]
     var aliases: [IPAlias]
+    var integrations: [String: Integration]?
+}
+
+struct Integration: Decodable, Hashable {
+    var configured: Bool
+    var status: String
+    var lastSync: String?
+    var ok: Bool?
+}
+
+struct DeviceAction: Decodable, Hashable, Identifiable {
+    var id: String
+    var label: String
+    var confirm: String?
+}
+
+struct FirmwareModule: Decodable, Hashable {
+    var module: String
+    var channel: Int?
+    var current: String?
+    var latest: String?
+    var canUpgrade: Bool
+
+    var hasUpdate: Bool { canUpgrade && latest != nil && latest != current }
+}
+
+struct UniFiInfo: Decodable, Hashable {
+    var platform: String?
+    var essid: String?
+    var serial: String?
+    var `default`: Bool?
+    var controller: Bool?
+    var adopted: Bool?
+    var upgradable: Bool?
+    var latest: String?
+}
+
+struct NetgearInfo: Decodable, Hashable {
+    var dhcp: Bool?
+    var firmware2: String?
+    var location: String?
 }
 
 struct IPv4Addr: Decodable, Hashable {
@@ -64,6 +105,12 @@ struct Device: Decodable, Identifiable, Hashable {
     var name: String?
     var services: [String]?
     var tuya: TuyaInfo?
+    var unifi: UniFiInfo?
+    var netgear: NetgearInfo?
+    var web: String?
+    var fwModules: [FirmwareModule]?
+    var updateAvailable: Bool?
+    var actions: [DeviceAction]?
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }
@@ -83,6 +130,9 @@ struct Device: Decodable, Identifiable, Hashable {
         case "tplink": return "TP-Link"
         case "tuya": return "Tuya / Smart Life"
         case "amazon": return "Amazon"
+        case "unifi": return "UniFi"
+        case "netgear": return "NETGEAR"
+        case "qnap": return "QNAP"
         default: return "Autre"
         }
     }
@@ -95,6 +145,9 @@ struct Device: Decodable, Identifiable, Hashable {
         case "tplink": return "Équipement TP-Link"
         case "tuya": return "Appareil Tuya / Smart Life"
         case "amazon": return "Appareil Amazon"
+        case "unifi": return "Équipement UniFi"
+        case "netgear": return "Équipement NETGEAR"
+        case "qnap": return "NAS QNAP"
         default: return "Identification partielle"
         }
     }
@@ -108,6 +161,12 @@ struct TuyaInfo: Decodable, Hashable {
     var gwId: String?
     var productKey: String?
     var version: String?
+    var category: String?
+    var productName: String?
+    var online: Bool?
+    var sub: Bool?
+    var parent: String?
+    var gateway: Bool?
 }
 
 struct LogEntry: Decodable, Hashable {
