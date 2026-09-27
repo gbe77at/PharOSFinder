@@ -202,7 +202,8 @@ def ubnt_discover(wait=3.0, bind_ip="", ifindex=None):
 
 # ─────────────────────────── QNAP ───────────────────────────
 
-QNAP_PORTS = ((8080, "http"), (443, "https"), (5000, "http"), (80, "http"))
+QNAP_PORTS = ((8080, "http"), (443, "https"), (5000, "http"), (5001, "https"), (80, "http"),
+              (8081, "http"), (8443, "https"), (9443, "https"))
 
 
 def parse_qnap_xml(text):
@@ -216,11 +217,23 @@ def parse_qnap_xml(text):
             "build": tag("build"), "hostname": tag("hostname"), "platform": tag("platform")}
 
 
-def qnap_probe(ip, timeout=4):
-    """Lit modèle / firmware / nom d'un NAS QNAP via la page publique authLogin.cgi."""
+def qnap_probe(ip, timeout=4, first=None):
+    """Lit modèle / firmware / nom d'un NAS QNAP via la page publique authLogin.cgi.
+    `first` : adresse web annoncée par le NAS (mDNS), essayée en premier."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                          urllib.request.HTTPSHandler(context=_insecure_ctx()))
-    for port, scheme in QNAP_PORTS:
+    candidates = []
+    if first:
+        u = urllib.parse.urlparse(first)
+        if u.port:
+            candidates.append((u.port, u.scheme))
+    candidates += [c for c in QNAP_PORTS if c not in candidates]
+    for port, scheme in candidates:
+        try:
+            with socket.create_connection((ip, port), timeout=1):
+                pass
+        except OSError:
+            continue
         url = f"{scheme}://{ip}:{port}/cgi-bin/authLogin.cgi"
         try:
             with opener.open(url, timeout=timeout) as r:

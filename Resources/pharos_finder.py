@@ -721,7 +721,8 @@ def _new_device(key, mac, ip):
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
             "announced": None, "name": None, "services": [], "tuya": None, "unifi": None,
-            "netgear": None, "qnap": None, "fw_modules": [], "update_available": False, "role": None}
+            "netgear": None, "qnap": None, "fw_modules": [], "update_available": False, "role": None,
+            "mdns_ports": {}}
 
 
 KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "tuya", "amazon", "other")   # ordre d'affichage
@@ -807,7 +808,8 @@ def fingerprint(dev_id):
         ip = ip4 or d["ipv6"]  # IPv6 link-local quand l'IPv4 est inconnue
     vendor = (vendor_of(mac) or lookup_vendor_online(mac)) if mac else None
     probe_ports = (22, 80, 443) + (AMAZON_PORTS if vendor and "amazon" in vendor.lower() else ())
-    open_ports = [p for p in probe_ports if tcp_open(ip, p)]
+    with cf.ThreadPoolExecutor(len(probe_ports)) as ex:
+        open_ports = [p for p, ok in zip(probe_ports, ex.map(lambda p: tcp_open(ip, p), probe_ports)) if ok]
     info = {"ports": open_ports, "reachable": bool(open_ports) or ping(ip, 800), "fingerprinted": True}
     if vendor and "amazon" in vendor.lower():
         with LOCK:
@@ -833,7 +835,7 @@ def fingerprint(dev_id):
 
 
 def fingerprint_many(ids):
-    with cf.ThreadPoolExecutor(8) as ex:
+    with cf.ThreadPoolExecutor(16) as ex:
         list(ex.map(fingerprint, ids))
 
 
@@ -1045,18 +1047,20 @@ def name_hosts(iface):
             return socket.gethostbyaddr(ip)[0].split(".")[0]
         except (OSError, UnicodeError):
             return None
-    with cf.ThreadPoolExecutor(16) as ex:
-        futs = {ex.submit(rdns, ip): (dev_id, ip) for dev_id, ip in todo}
-        try:
-            for fut in cf.as_completed(futs, timeout=6):
-                name = fut.result()
-                dev_id, ip = futs[fut]
-                if name and name != ip:
-                    with LOCK:
-                        if dev_id in DEVICES and not DEVICES[dev_id].get("name"):
-                            DEVICES[dev_id]["name"] = name
-        except cf.TimeoutError:
-            pass
+    ex = cf.ThreadPoolExecutor(16)
+    futs = {ex.submit(rdns, ip): (dev_id, ip) for dev_id, ip in todo}
+    try:
+        for fut in cf.as_completed(futs, timeout=5):
+            name = fut.result()
+            dev_id, ip = futs[fut]
+            if name and name != ip:
+                with LOCK:
+                    if dev_id in DEVICES and not DEVICES[dev_id].get("name"):
+                        DEVICES[dev_id]["name"] = name
+    except cf.TimeoutError:
+        log("Noms DNS : le serveur DNS répond lentement, recherche abandonnée après 5 s.")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)   # ne pas attendre les résolutions bloquées
     if gw:
         with LOCK:
             d = next((x for x in DEVICES.values() if x["ip"] == gw), None)
@@ -1070,7 +1074,8 @@ def probe_qnap(dev_id):
     with LOCK:
         d = DEVICES.get(dev_id)
         ip = d["ip"] if d else None
-    info = fv.qnap_probe(ip) if ip else None
+    announced = d.get("web") if d else None
+    info = fv.qnap_probe(ip, first=announced) if ip else None
     if info:
         upsert(mac=d["mac"], ip=ip, source="QNAP", model=info["model"], vendor="QNAP",
                firmware=" ".join(filter(None, [info["firmware"], f"build {info['build']}" if info["build"] else None])),
@@ -1438,6 +1443,7 @@ def start_job(name, label, fn, *args):
 
 
 def job_scan(iface_name, factory, full, extra):
+    t_scan = time.time()
     iface = get_iface(iface_name)
     if not iface:
         raise RuntimeError(f"interface {iface_name} introuvable")
@@ -1546,11 +1552,14 @@ def job_scan(iface_name, factory, full, extra):
         if stopped():
             log(f"Recherche arrêtée : étape « {label} » et suivantes ignorées.", "warn")
             return
+        t0 = time.time()
         try:
             step()
         except Exception as e:  # noqa: BLE001
             log(f"{label} : {e}", "warn")
-    log("Recherche terminée.", "ok")
+        if time.time() - t0 > 20:
+            log(f"Étape « {label} » : {int(time.time() - t0)} s.", "warn")
+    log(f"Recherche terminée en {int(time.time() - t_scan)} s.", "ok")
 
 
 TCPDUMP_HEAD = re.compile(r"^\S+ ([0-9a-f:]{17}) > (\S+), ethertype (\S+) \(0x[0-9a-f]+\), length \d+: (.*)$")
@@ -1796,7 +1805,7 @@ def tuya_listener():
 MDNS_SERVICES = ("_amzn-wplay._tcp", "_amzn-alexa._tcp", "_spotify-connect._tcp", "_googlecast._tcp",
                  "_airplay._tcp", "_raop._tcp", "_hap._tcp", "_companion-link._tcp", "_http._tcp",
                  "_ipp._tcp", "_printer._tcp", "_smb._tcp", "_device-info._tcp", "_matter._tcp",
-                 "_sonos._tcp", "_workstation._tcp", "_qdiscover._tcp")
+                 "_sonos._tcp", "_workstation._tcp", "_qdiscover._tcp", "_https._tcp")
 
 
 def _dns_name(msg, p):
@@ -1824,9 +1833,19 @@ def mdns_query_packet(services=MDNS_SERVICES):
     return struct.pack("!HHHHHH", 0, 0, len(services), 0, 0, 0) + q
 
 
+def _svc_of(name):
+    """« NAS._qdiscover._tcp.local » → « _qdiscover._tcp »"""
+    parts = name.replace(".local", "").split(".")
+    for i in range(len(parts) - 1):
+        if parts[i].startswith("_") and parts[i + 1] in ("_tcp", "_udp"):
+            return parts[i] + "." + parts[i + 1]
+    return None
+
+
 def parse_mdns(msg):
-    """Réponse mDNS → {"hosts": {ip: nom}, "instances": [(service, instance)], "services": set}"""
-    out = {"hosts": {}, "instances": [], "services": set()}
+    """Réponse mDNS → {"hosts": {ip: nom}, "instances": [(service, instance)], "services": set,
+    "ports": {service: port}, "txt": {service: {clé: valeur}}}"""
+    out = {"hosts": {}, "instances": [], "services": set(), "ports": {}, "txt": {}}
     if len(msg) < 12:
         return out
     qd, an, ns, ar = struct.unpack("!HHHH", msg[4:12])
@@ -1850,7 +1869,37 @@ def parse_mdns(msg):
                 out["services"].add(svc)
         elif rtype == 1 and rdlen == 4:  # A
             out["hosts"][socket.inet_ntoa(msg[rd:rd + 4])] = name.replace(".local", "")
+        elif rtype == 33 and rdlen >= 6:  # SRV : priorité, poids, port, cible
+            svc = _svc_of(name)
+            if svc:
+                out["ports"][svc] = struct.unpack("!H", msg[rd + 4:rd + 6])[0]
+                out["services"].add(svc)
+        elif rtype == 16:  # TXT : suite de chaînes « clé=valeur »
+            svc = _svc_of(name)
+            kv, q = {}, rd
+            while q < rd + rdlen:
+                ln = msg[q]
+                item = msg[q + 1:q + 1 + ln].decode("utf-8", "ignore")
+                q += 1 + ln
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    kv[k.strip()] = v.strip()
+            if svc and kv:
+                out["txt"].setdefault(svc, {}).update(kv)
     return out
+
+
+def web_from_mdns(ip, ports, txt):
+    """Adresse web annoncée : QNAP (_qdiscover : accessType/accessPort), sinon _https/_http."""
+    q = txt.get("_qdiscover._tcp") or {}
+    if q.get("accessPort"):
+        scheme = "https" if "https" in (q.get("accessType") or "").lower() else "http"
+        return f"{scheme}://{ip}:{q['accessPort']}/"
+    if "_https._tcp" in ports:
+        return f"https://{ip}:{ports['_https._tcp']}/"
+    if "_http._tcp" in ports:
+        return f"http://{ip}:{ports['_http._tcp']}/"
+    return None
 
 
 def discover_mdns(iface, wait=3.0):
@@ -1875,8 +1924,11 @@ def discover_mdns(iface, wait=3.0):
             except socket.timeout:
                 continue
             r = parse_mdns(data)
-            e = found.setdefault(addr[0], {"names": [], "services": set(), "host": None})
+            e = found.setdefault(addr[0], {"names": [], "services": set(), "host": None, "ports": {}, "txt": {}})
             e["services"] |= r["services"]
+            e["ports"].update(r["ports"])
+            for k, v in r["txt"].items():
+                e["txt"].setdefault(k, {}).update(v)
             e["names"] += [inst for _, inst in r["instances"] if inst not in e["names"]]
             e["host"] = e["host"] or r["hosts"].get(addr[0])
     except OSError as e:
@@ -1891,7 +1943,18 @@ def discover_mdns(iface, wait=3.0):
         # « AA11BB22@Salon » (AirPlay audio) → « Salon »
         names = [n.split("@", 1)[-1] for n in e["names"]]
         name = next((n for n in names if n), None) or e["host"]
-        d = upsert(mac=macs.get(ip), ip=ip, source="mDNS", name=name, services=sorted(e["services"]))
+        extra = {}
+        web = web_from_mdns(ip, e["ports"], e["txt"])
+        if web:
+            extra["web"] = web
+        q = e["txt"].get("_qdiscover._tcp") or {}
+        if q:  # annonce QNAP (celle qu'utilise QNAP Finder)
+            extra.update(vendor="QNAP", qnap={"mdns": q},
+                         model=q.get("displayModel") or q.get("model"),
+                         firmware=" ".join(filter(None, [q.get("fwVer"),
+                                                         f"build {q['fwBuildNum']}" if q.get("fwBuildNum") else None])) or None)
+        d = upsert(mac=macs.get(ip), ip=ip, source="mDNS", name=name, services=sorted(e["services"]),
+                   mdns_ports=e["ports"], **extra)
         if d and d["kind"] == "amazon" and d.get("fingerprinted"):
             d["model"] = amazon_model(d["ports"], d["services"])
     log(f"mDNS : {len(found)} appareil(s) nommé(s).", "ok" if found else "info")
@@ -2706,6 +2769,7 @@ button:disabled{opacity:.45;cursor:default}
 main{flex:1;display:flex;min-height:0}
 .list{flex:1;overflow:auto;min-width:0}
 table{width:100%;border-collapse:collapse}
+th[data-sort]{cursor:pointer;user-select:none} th.asc::after{content:" ▲"} th.desc::after{content:" ▼"}
 th{position:sticky;top:0;background:var(--panel2);text-align:left;font-weight:600;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:7px 10px;border-bottom:1px solid var(--line)}
 td{padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 tr.row{cursor:pointer;background:var(--panel)}
@@ -2793,7 +2857,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
 <main>
   <div class="list">
     <table>
-      <thead><tr><th>Équipement</th><th>Adresse IP</th><th>MAC</th><th>Fabricant</th><th>Interface</th><th>Services</th><th>Vu</th></tr></thead>
+      <thead><tr><th data-sort="name">Équipement</th><th data-sort="ip">Adresse IP</th><th data-sort="mac">MAC</th><th data-sort="vendor">Fabricant</th><th data-sort="iface">Interface</th><th>Services</th><th data-sort="seen">Vu</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty"><b>Aucun équipement pour l'instant</b>Choisis l'interface réseau, puis <em>Rechercher</em>. Pharos, TP-Link, Tuya/Smart Life et Amazon sont identifiés.<br>Un Pharos dans une plage inconnue : <em>Écoute passive</em>, il s'annonce en moins d'une minute.</div>
@@ -2810,6 +2874,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get('t');
+let sortBy = 'ip', sortDir = 1;
 let S = null, selected = null, filter = 'all', ifaceTouched = false, logLen = 0;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2865,7 +2930,12 @@ function render(){
   $('aliases').innerHTML = S.aliases.map(a => `<span class="alias" title="${esc(a.keep_reason)}">${esc(a.iface)} ${esc(a.ip)}<button data-rm="${esc(a.iface)}|${esc(a.ip)}" title="Retirer l'alias">×</button></span>`).join('');
 
   // rows
+  const ipKey = ip => ip ? ip.split('.').map(n => n.padStart(3, '0')).join('.') : '~';
+  const KEY = {name: d => displayName(d).toLowerCase(), ip: d => ipKey(d.ip), mac: d => d.mac || '~',
+               vendor: d => (d.vendor || '~').toLowerCase(), iface: d => d.iface || '~', seen: d => d.last_seen || ''};
   const list = S.devices.filter(d => filter === 'all' || (filter === 'tplink' ? (d.kind === 'tplink' || d.kind === 'pharos') : d.kind === filter));
+  if(sortBy){ const k = KEY[sortBy]; list.sort((a, b) => (k(a) < k(b) ? -1 : k(a) > k(b) ? 1 : 0) * sortDir); }
+  document.querySelectorAll('th[data-sort]').forEach(th => th.className = th.dataset.sort === sortBy ? (sortDir > 0 ? 'asc' : 'desc') : '');
   $('empty').style.display = list.length ? 'none' : 'block';
   if(!list.length && S.devices.length){ $('empty').innerHTML = `<b>${S.devices.length} équipement(s) masqué(s) par le filtre</b>Clique sur <em>Tous</em> pour les voir.`; }
   $('rows').innerHTML = list.map(d => {
@@ -2961,6 +3031,8 @@ function renderDetail(){
 }
 
 document.addEventListener('click', async e => {
+  const th = e.target.closest('th[data-sort]');
+  if(th){ sortDir = sortBy === th.dataset.sort ? -sortDir : 1; sortBy = th.dataset.sort; render(); return; }
   const row = e.target.closest('tr.row');
   if(row){ selected = row.dataset.id; detailKey=''; render(); return; }
   const rm = e.target.closest('[data-rm]');

@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var showOptions = false
     @State private var showLog = true
     @State private var showAccounts = false
+    @State private var sortOrder = [KeyPathComparator(\Device.sortIP)]
 
     private var allDevices: [Device] { engine.snapshot?.devices ?? [] }
 
@@ -42,6 +43,7 @@ struct ContentView: View {
                     || [d.displayName, d.ip ?? "", d.mac ?? "", d.vendor ?? "", d.model ?? "", d.ips.joined(separator: " ")]
                         .joined(separator: " ").localizedCaseInsensitiveContains(search)
             }
+            .sorted(using: sortOrder)
     }
 
     private var selectedDevice: Device? { allDevices.first { $0.id == selection } }
@@ -155,8 +157,8 @@ struct ContentView: View {
         if devices.isEmpty {
             EmptyStateView(hidden: allDevices.count, filter: $filter)
         } else {
-            Table(devices, selection: $selection) {
-                TableColumn("Équipement") { d in
+            Table(devices, selection: $selection, sortOrder: $sortOrder) {
+                TableColumn("Équipement", value: \.sortName) { d in
                     HStack(spacing: 8) {
                         KindDot(kind: d.kind)
                         Text(d.displayName)
@@ -166,7 +168,7 @@ struct ContentView: View {
                 }
                 .width(min: 140, ideal: 180)
 
-                TableColumn("Adresse IP") { d in
+                TableColumn("Adresse IP", value: \.sortIP) { d in
                     HStack(spacing: 4) {
                         if let ip = d.ip {
                             Text(ip).font(.system(.body, design: .monospaced))
@@ -180,12 +182,12 @@ struct ContentView: View {
                 }
                 .width(min: 110, ideal: 130)
 
-                TableColumn("MAC") { d in
+                TableColumn("MAC", value: \.sortMAC) { d in
                     Text(d.mac ?? "—").font(.system(.body, design: .monospaced)).foregroundStyle(.secondary)
                 }
                 .width(min: 130, ideal: 150)
 
-                TableColumn("Type") { d in
+                TableColumn("Type", value: \.sortType) { d in
                     Text(d.kind == "other" ? (d.vendor ?? "—") : d.kindLabel).lineLimit(1)
                 }
                 .width(min: 80, ideal: 110)
@@ -195,7 +197,7 @@ struct ContentView: View {
                 }
                 .width(min: 120, ideal: 190)
 
-                TableColumn("Vu à") { d in
+                TableColumn("Vu à", value: \.sortSeen) { d in
                     Text(d.lastSeen ?? "").foregroundStyle(.secondary)
                 }
                 .width(min: 55, ideal: 65)

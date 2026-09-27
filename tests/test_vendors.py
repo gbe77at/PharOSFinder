@@ -156,6 +156,41 @@ class TuyaCloudTests(unittest.TestCase):
         self.assertIn("tuya:upgrade:9", acts)
 
 
+def dns_name(n):
+    return b"".join(bytes([len(x)]) + x.encode() for x in n.split(".")) + b"\0"
+
+
+def qnap_mdns_response(ip="10.10.10.5", port=8443):
+    inst = "NAS-TVS882T._qdiscover._tcp.local"
+    txt = b"".join(bytes([len(x)]) + x for x in (b"accessType=https", f"accessPort={port}".encode(),
+                                                 b"model=TVS-X82T", b"displayModel=TVS-882T",
+                                                 b"fwVer=5.2.4", b"fwBuildNum=20250426"))
+    ptr = dns_name("_qdiscover._tcp.local") + struct.pack("!HHIH", 12, 1, 120, len(dns_name(inst))) + dns_name(inst)
+    srv_rd = struct.pack("!HHH", 0, 0, port) + dns_name("NAS-TVS882T.local")
+    srv = dns_name(inst) + struct.pack("!HHIH", 33, 0x8001, 120, len(srv_rd)) + srv_rd
+    tx = dns_name(inst) + struct.pack("!HHIH", 16, 0x8001, 120, len(txt)) + txt
+    a = dns_name("NAS-TVS882T.local") + struct.pack("!HHIH", 1, 0x8001, 120, 4) + socket.inet_aton(ip)
+    return struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 3) + ptr + srv + tx + a
+
+
+class MdnsQnapTests(unittest.TestCase):
+    def test_srv_txt(self):
+        r = pf.parse_mdns(qnap_mdns_response())
+        self.assertEqual(r["ports"]["_qdiscover._tcp"], 8443)
+        self.assertEqual(r["txt"]["_qdiscover._tcp"]["displayModel"], "TVS-882T")
+        self.assertEqual(r["hosts"], {"10.10.10.5": "NAS-TVS882T"})
+
+    def test_web_from_announce(self):
+        r = pf.parse_mdns(qnap_mdns_response(port=5443))
+        self.assertEqual(pf.web_from_mdns("10.10.10.5", r["ports"], r["txt"]), "https://10.10.10.5:5443/")
+        self.assertEqual(pf.web_from_mdns("10.0.0.9", {"_http._tcp": 8123}, {}), "http://10.0.0.9:8123/")
+        self.assertIsNone(pf.web_from_mdns("10.0.0.9", {}, {}))
+
+    def test_svc_of(self):
+        self.assertEqual(pf._svc_of("My NAS._qdiscover._tcp.local"), "_qdiscover._tcp")
+        self.assertIsNone(pf._svc_of("host.local"))
+
+
 class VendorDbTests(unittest.TestCase):
     def test_offline_registry(self):
         for mac, want in (("24:5e:be:1a:1f:af", "QNAP"), ("0c:43:f9:99:25:b4", "Amazon"), ("08:bd:43:71:f6:e5", "NETGEAR"),

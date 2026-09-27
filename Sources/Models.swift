@@ -156,6 +156,16 @@ struct Device: Decodable, Identifiable, Hashable {
 
     var isManageable: Bool { kind == "pharos" || kind == "tplink" }
 
+    // Clés de tri du tableau (clic sur les en-têtes)
+    var sortName: String { displayName.lowercased() }
+    var sortIP: String {
+        guard let ip = ip else { return "~" }
+        return ip.split(separator: ".").map { String(repeating: "0", count: max(0, 3 - $0.count)) + $0 }.joined(separator: ".")
+    }
+    var sortMAC: String { mac ?? "~" }
+    var sortType: String { kind == "other" ? (vendor ?? "~") : kindLabel }
+    var sortSeen: String { lastSeen ?? "" }
+
     var isOutOfRange: Bool { ip != nil && !inRange }
 }
 
