@@ -189,6 +189,9 @@ struct DetailView: View {
             if let n = device.name {
                 infoRow("Nom", n)
             }
+            if let r = device.role {
+                infoRow("Rôle", r)
+            }
             infoRow("MAC", device.mac ?? "—", mono: true)
             if let v6 = device.ipv6 {
                 infoRow("IPv6", v6, mono: true)

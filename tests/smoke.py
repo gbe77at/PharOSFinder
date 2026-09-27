@@ -57,6 +57,7 @@ def main():
         assert not state["jobs"], "la recherche ne se termine pas"
         assert any("Recherche terminée" in l["msg"] for l in state["log"]), "recherche en échec"
         assert not any(l["level"] == "error" for l in state["log"]), "erreur dans le journal"
+        assert not any("(0 fabricants connus)" in l["msg"] for l in state["log"]), "base des fabricants absente"
         print("équipements:", len(state["devices"]))
         call("/api/quit", {})
         proc.wait(timeout=10)

@@ -40,7 +40,7 @@ jobs:
       - name: Icône
         run: python -c "from PIL import Image; Image.open('Resources/AppIcon.iconset/icon_256x256.png').save('PharosFinder.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
       - name: Exécutable
-        run: pyinstaller --noconfirm --onefile --console --name PharosFinder --icon PharosFinder.ico Resources/pharos_finder.py
+        run: pyinstaller --noconfirm --onefile --console --name PharosFinder --icon PharosFinder.ico --add-data "Resources/oui.txt.gz:." Resources/pharos_finder.py
       - name: Test de fumée de l'exe
         run: python tests/smoke.py dist/PharosFinder.exe
       - name: Archive

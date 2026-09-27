@@ -67,7 +67,7 @@ final class Engine: ObservableObject {
             }
             let port = Engine.freePort()
             let pid = ProcessInfo.processInfo.processIdentifier
-            let args = [python, script, "--port", String(port), "--token", self.token,
+            let args = [python, "-B", script, "--port", String(port), "--token", self.token,
                         "--no-browser", "--parent-pid", String(pid)]
             try? FileManager.default.removeItem(at: self.logURL)
             DispatchQueue.main.async {

@@ -40,6 +40,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+sys.dont_write_bytecode = True   # lancé en root depuis l'app : ne rien écrire dans le bundle signé
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import finder_vendors as fv  # noqa: E402  (protocoles UniFi, NETGEAR, QNAP, Tuya cloud)
 
@@ -96,6 +97,7 @@ LOG = []            # entrées de journal
 JOBS = {}           # nom -> {"label", "started", "proc"?}
 ALIASES = []        # [{"iface", "ip", "mask", "keep_reason"}]
 VENDOR_CACHE = {}
+_VENDOR_FAILED = {}
 CONFLICTS = set()
 VENDOR_LOCK = threading.Lock()
 TOKEN = secrets.token_urlsafe(16)
@@ -146,6 +148,38 @@ def is_multicast_mac(mac):
     return bool(int(mac.split(":")[0], 16) & 0x01)
 
 
+_OUI_DB = None
+_OUI_LOCK = threading.Lock()
+
+
+def oui_db():
+    """Registre IEEE embarqué (Resources/oui.txt.gz, régénéré par tools/update_oui.py)."""
+    global _OUI_DB
+    with _OUI_LOCK:
+        if _OUI_DB is None:
+            import gzip
+            _OUI_DB = {}
+            for base in (getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.abspath(__file__))):
+                path = os.path.join(base, "oui.txt.gz") if base else None
+                if path and os.path.exists(path):
+                    try:
+                        with gzip.open(path, "rt", encoding="utf-8") as f:
+                            _OUI_DB = dict(line.rstrip("\n").split("\t", 1) for line in f if "\t" in line)
+                    except (OSError, ValueError):
+                        _OUI_DB = {}
+                    break
+        return _OUI_DB
+
+
+def short_vendor(name):
+    if not name:
+        return name
+    low = name.lower()
+    if "tp-link" in low or "tp link" in low:
+        return "TP-Link"
+    return name
+
+
 def vendor_of(mac):
     if not mac:
         return None
@@ -153,14 +187,16 @@ def vendor_of(mac):
         return "TP-Link"
     if is_local_mac(mac):
         return "MAC locale / aléatoire"
-    return VENDOR_CACHE.get(mac[:8])
+    name = oui_db().get(mac[:8].replace(":", ""))
+    return short_vendor(name) if name else VENDOR_CACHE.get(mac[:8])
 
 
 def lookup_vendor_online(mac):
     """Résout le fabricant via api.macvendors.com (1 requête/s max). Silencieux si hors ligne."""
     prefix = mac[:8]
-    if prefix in VENDOR_CACHE or prefix in TPLINK_OUIS or is_local_mac(mac):
-        return vendor_of(mac)
+    known = vendor_of(mac)
+    if known or prefix in VENDOR_CACHE or time.time() - _VENDOR_FAILED.get(prefix, 0) < 600:
+        return known
     with VENDOR_LOCK:
         if prefix in VENDOR_CACHE:
             return VENDOR_CACHE[prefix]
@@ -172,9 +208,11 @@ def lookup_vendor_online(mac):
         except Exception:
             name = None
         time.sleep(1.1)
-        if name and ("tp-link" in name.lower() or "tp link" in name.lower()):
-            name = "TP-Link"
-        VENDOR_CACHE[prefix] = name
+        name = short_vendor(name)
+        if name:  # un échec (hors ligne, limite 429) n'est pas mémorisé : nouvel essai 10 min plus tard
+            VENDOR_CACHE[prefix] = name
+        else:
+            _VENDOR_FAILED[prefix] = time.time()
         return name
 
 
@@ -683,7 +721,7 @@ def _new_device(key, mac, ip):
             "tplink_hint": False, "web": None, "reachable": None, "last_seen": None,
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
             "announced": None, "name": None, "services": [], "tuya": None, "unifi": None,
-            "netgear": None, "qnap": None, "fw_modules": [], "update_available": False}
+            "netgear": None, "qnap": None, "fw_modules": [], "update_available": False, "role": None}
 
 
 KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "tuya", "amazon", "other")   # ordre d'affichage
@@ -983,6 +1021,49 @@ def discover_vendors(iface):
         log(f"Découverte NETGEAR impossible : {e}", "warn")
     if not n:
         log("Aucun équipement UniFi ou NETGEAR ne s'est annoncé.")
+
+
+def default_gateway():
+    if IS_MAC:
+        m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", run(["route", "-n", "get", "default"]).stdout)
+    elif IS_WIN:
+        m = re.search(r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)",
+                      run(["route", "print", "-4", "0.0.0.0"]).stdout, re.M)
+    else:
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", run(["ip", "route", "show", "default"]).stdout)
+    return m.group(1) if m else None
+
+
+def name_hosts(iface):
+    """Nom DNS inverse (serveur DHCP/DNS du routeur) et repérage de la passerelle."""
+    gw = default_gateway()
+    with LOCK:
+        todo = [(d["id"], d["ip"]) for d in DEVICES.values() if d["ip"] and not d.get("name")]
+
+    def rdns(ip):
+        try:
+            return socket.gethostbyaddr(ip)[0].split(".")[0]
+        except (OSError, UnicodeError):
+            return None
+    with cf.ThreadPoolExecutor(16) as ex:
+        futs = {ex.submit(rdns, ip): (dev_id, ip) for dev_id, ip in todo}
+        try:
+            for fut in cf.as_completed(futs, timeout=6):
+                name = fut.result()
+                dev_id, ip = futs[fut]
+                if name and name != ip:
+                    with LOCK:
+                        if dev_id in DEVICES and not DEVICES[dev_id].get("name"):
+                            DEVICES[dev_id]["name"] = name
+        except cf.TimeoutError:
+            pass
+    if gw:
+        with LOCK:
+            d = next((x for x in DEVICES.values() if x["ip"] == gw), None)
+            if d:
+                d["role"] = "Routeur (passerelle par défaut)"
+                if not d.get("name"):
+                    d["name"] = "Routeur" + (f" · {d['title']}" if d.get("title") else "")
 
 
 def probe_qnap(dev_id):
@@ -1448,21 +1529,27 @@ def job_scan(iface_name, factory, full, extra):
                 log(f"Alias {alias} gardé pour accéder à {net} (retiré à la fermeture)")
             else:
                 remove_alias(iface_name, alias)
+    def stopped():
+        return JOBS.get("scan", {}).get("stop")
+
+    # Identités annoncées d'abord (rapides), puis sondage de chaque équipement.
+    steps = [("noms Bonjour", lambda: discover_mdns(iface)), ("UniFi / NETGEAR", lambda: discover_vendors(iface))]
     if found_ids:
-        log(f"Identification de {len(set(found_ids))} équipement(s)…")
-        fingerprint_many(list(dict.fromkeys(found_ids)))
-    if not JOBS.get("scan", {}).get("stop"):
-        discover_mdns(iface)
-    if not JOBS.get("scan", {}).get("stop"):
-        discover_vendors(iface)
+        steps.append(("identification", lambda: (log(f"Identification de {len(set(found_ids))} équipement(s)…"),
+                                                 fingerprint_many(list(dict.fromkeys(found_ids))))))
+    steps.append(("noms DNS et routeur", lambda: name_hosts(iface)))
     for vendor, job in (("tuya", job_tuya_sync), ("unifi", job_unifi_sync)):
-        if vendor in _CLIENTS and not JOBS.get("scan", {}).get("stop"):
-            try:
-                job()
-            except Exception as e:  # noqa: BLE001
-                log(str(e), "warn")
-    if not JOBS.get("scan", {}).get("stop"):
-        discover_ipv6(iface)
+        if vendor in _CLIENTS:
+            steps.append((f"compte {vendor}", job))
+    steps.append(("IPv6", lambda: discover_ipv6(iface)))
+    for label, step in steps:
+        if stopped():
+            log(f"Recherche arrêtée : étape « {label} » et suivantes ignorées.", "warn")
+            return
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001
+            log(f"{label} : {e}", "warn")
     log("Recherche terminée.", "ok")
 
 
@@ -1659,15 +1746,16 @@ def handle_tuya(data, sender_ip, port):
     obj = parse_tuya_broadcast(data, port)
     if obj is None:
         return
-    ip = obj.get("ip") or sender_ip
-    try:
-        ipaddress.IPv4Address(ip)
-    except ValueError:
-        ip = sender_ip
+    # L'expéditeur du paquet fait foi : le champ « ip » annoncé peut être périmé.
+    ip = sender_ip or obj.get("ip")
     info = {"gw_id": obj.get("gwId") or obj.get("devId"), "product_key": obj.get("productKey"),
             "version": str(obj.get("version") or ("3.1" if port == 6666 else "3.3"))}
-    mac = next((e["mac"] for e in arp_table() if e["ip"] == ip), None) if ip not in {k[0] for k in _TUYA_SEEN} else None
-    d = upsert(mac=mac, ip=ip, source="Tuya", tuya=info, model=f"Tuya v{info['version']}",
+    if not info["gw_id"]:  # annonce illisible (v3.5 d'un autre format) : on garde ce qu'on sait déjà
+        with LOCK:
+            known = next((d for d in DEVICES.values() if d["ip"] == ip and d.get("tuya")), None)
+        if known:
+            return
+    d = upsert(ip=ip, source="Tuya", tuya=info, model=f"Tuya (protocole v{info['version']})",
                title=f"Smart Life / Tuya · {info['gw_id'] or 'ID inconnu'}")
     key = (ip, info["gw_id"])
     if d and key not in _TUYA_SEEN:
@@ -2563,7 +2651,7 @@ def main():
     print(f"\n  Pharos Finder {VERSION} ({PLATFORM})\n  Interface : {url}\n"
           "  Garde cette fenêtre ouverte. Ctrl+C ou fermeture = arrêt (les adresses temporaires "
           "sont retirées).\n")
-    log("Pharos Finder prêt. Choisis l'interface reliée au Pharos puis « Rechercher ».", "ok")
+    log(f"Pharos Finder prêt ({len(oui_db())} fabricants connus). Choisis l'interface puis « Rechercher ».", "ok")
     if not args.no_browser:
         def _open():
             try:
@@ -2735,7 +2823,7 @@ async function api(path, body){
 const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', unifi:'UniFi', netgear:'NETGEAR', qnap:'QNAP', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
 function displayName(d){
   if(d.kind === 'pharos') return d.model || 'PharOS';
-  return d.name || d.model || d.title || (d.kind === 'other' ? 'Équipement' : KIND_LABEL[d.kind]);
+  return d.name || d.model || d.title || (d.kind === 'other' ? (d.vendor && !d.vendor.startsWith('MAC locale') ? d.vendor : 'Équipement') : KIND_LABEL[d.kind]);
 }
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none',4500); }
 
@@ -2832,6 +2920,7 @@ function renderDetail(){
       ${d.ipv6 ? `<dt>IPv6</dt><dd class="mono">${esc(d.ipv6)}</dd>` : ''}
       <dt>Type</dt><dd>${esc(kindLbl)}${d.model && displayName(d) !== d.model ? ' · ' + esc(d.model) : ''}</dd>
       ${d.name ? `<dt>Nom</dt><dd>${esc(d.name)}</dd>` : ''}
+      ${d.role ? `<dt>Rôle</dt><dd>${esc(d.role)}</dd>` : ''}
       <dt>Fabricant</dt><dd>${esc(d.vendor || 'inconnu')}</dd>
       ${d.tuya ? `<dt>ID Tuya</dt><dd class="mono">${esc(d.tuya.gw_id || '—')}</dd><dt>Produit</dt><dd class="mono">${esc(d.tuya.product_key || '—')} · v${esc(d.tuya.version)}</dd>` : ''}
       ${(d.services||[]).length ? `<dt>Services</dt><dd>${esc(d.services.join(', '))}</dd>` : ''}

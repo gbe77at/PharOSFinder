@@ -156,6 +156,33 @@ class TuyaCloudTests(unittest.TestCase):
         self.assertIn("tuya:upgrade:9", acts)
 
 
+class VendorDbTests(unittest.TestCase):
+    def test_offline_registry(self):
+        for mac, want in (("24:5e:be:1a:1f:af", "QNAP"), ("0c:43:f9:99:25:b4", "Amazon"), ("08:bd:43:71:f6:e5", "NETGEAR"),
+                          ("68:d7:9a:45:aa:dd", "Ubiquiti"), ("c4:82:e1:8d:5a:7b", "Tuya"), ("cc:32:e5:9d:a9:a4", "TP-Link")):
+            self.assertIn(want, pf.vendor_of(mac))
+
+    def test_classification_without_network(self):
+        pf.DEVICES.clear()
+        d = pf.upsert(mac="24:5e:be:1a:1f:af", ip="10.10.10.5")
+        self.assertEqual(d["kind"], "qnap")
+
+
+class TuyaSenderTests(unittest.TestCase):
+    def test_sender_ip_wins_and_no_false_conflict(self):
+        pf.DEVICES.clear()
+        pf.CONFLICTS.clear()
+        pf.upsert(mac="c4:82:e1:8d:4d:ed", ip="10.10.10.48")
+        pf.upsert(mac="c4:82:e1:8d:5a:7b", ip="10.10.10.63")
+        body = json.dumps({"ip": "10.10.10.48", "gwId": "bf2b", "version": "3.3"}).encode()
+        frame = b"\x00\x00\x55\xaa" + struct.pack("!III", 0, 0x13, len(body) + 12) + b"\0" * 4 + body + b"\0" * 4 \
+            + b"\x00\x00\xaa\x55"
+        pf.handle_tuya(frame, "10.10.10.63", 6666)
+        self.assertEqual(pf.DEVICES["c4:82:e1:8d:5a:7b"]["tuya"]["gw_id"], "bf2b")
+        self.assertIsNone(pf.DEVICES["c4:82:e1:8d:4d:ed"]["tuya"])
+        self.assertFalse(pf.CONFLICTS)
+
+
 class EngineIntegrationTests(unittest.TestCase):
     def test_classify_vendors(self):
         for vendor, kind in (("Ubiquiti Inc", "unifi"), ("NETGEAR", "netgear"), ("QNAP Systems, Inc.", "qnap")):

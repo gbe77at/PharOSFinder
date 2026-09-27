@@ -111,6 +111,7 @@ struct Device: Decodable, Identifiable, Hashable {
     var fwModules: [FirmwareModule]?
     var updateAvailable: Bool?
     var actions: [DeviceAction]?
+    var role: String?
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }
@@ -121,6 +122,7 @@ struct Device: Decodable, Identifiable, Hashable {
         if let n = name, !n.isEmpty { return n }
         if let m = model { return m }
         if let t = title, !t.isEmpty { return t }
+        if kind == "other", let v = vendor, !v.hasPrefix("MAC locale") { return v }
         return kind == "other" ? "Équipement" : kindLabel
     }
 

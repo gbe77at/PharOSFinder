@@ -18,7 +18,9 @@ die() { printf "\n\033[1;31m✗ %s\033[0m\n" "$1"; exit 1; }
 command -v swiftc >/dev/null || die "swiftc introuvable : lance « xcode-select --install » puis relance ce script."
 
 say "Nettoyage"
-rm -rf "$BUILD"
+# Un ancien moteur lancé en root a pu laisser des fichiers root dans le bundle : on écarte le
+# dossier (renommer ne demande pas de droits) au lieu d'échouer. À supprimer : sudo rm -rf .build-old-*
+rm -rf "$BUILD" 2>/dev/null || { mv "$BUILD" ".build-old-$(date +%s)" && echo "  ⚠︎ ancien build écarté (fichiers root)"; }
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 say "Compilation SwiftUI"
@@ -39,7 +41,7 @@ done
 lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/PharosFinder"
 
 say "Ressources"
-cp Resources/pharos_finder.py Resources/finder_vendors.py "$APP/Contents/Resources/"
+cp Resources/pharos_finder.py Resources/finder_vendors.py Resources/oui.txt.gz "$APP/Contents/Resources/"
 iconutil -c icns Resources/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
