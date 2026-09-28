@@ -158,11 +158,17 @@ def nsdp_discover(host_mac, wait=3.0, bind_ip="", ifindex=None):
             s.close()
             continue
         try:
-            s.sendto(nsdp_read_request(host_mac), ("255.255.255.255", remote))
+            s.sendto(nsdp_read_request(host_mac, seq=1), ("255.255.255.255", remote))
         except OSError:
             s.close()
             continue
         socks.append(s)
+    time.sleep(0.4)   # 2e envoi : certains switchs (GS108PE) ignorent parfois le premier
+    for s, (_, remote) in zip(socks, [pr for pr in NSDP_PORTS]):
+        try:
+            s.sendto(nsdp_read_request(host_mac, seq=2), ("255.255.255.255", remote))
+        except OSError:
+            pass
     return _collect(socks, wait, parse_nsdp)
 
 
@@ -400,3 +406,122 @@ class UniFiController:
         if self.unifi_os is None:
             self.login()
         return self._req("POST", self._api("cmd/devmgr"), {"cmd": cmd, "mac": mac.lower()})
+
+
+# ─────────────────────────── Imprimantes 3D ───────────────────────────
+# Repris de gbe77at/3Dprinter-mcp (printer_link/discovery), validé sur le vrai réseau :
+# Bambu P2S par SSDP, Creality K2 Pro par Moonraker :4408/:7125.
+
+BAMBU_PORTS = (1990, 2021)            # annonces SSDP Bambu (en alternance, toutes les ~5 s)
+SSDP_GROUP = "239.255.255.250"
+#: codes modèle Bambu ; un code inconnu est gardé tel quel plutôt que deviné
+BAMBU_MODELS = {"3DPrinter-X1": "X1", "3DPrinter-X1-Carbon": "X1 Carbon", "C11": "P1P", "C12": "P1S",
+                "C13": "X1E", "N1": "A1 mini", "N2S": "A1", "N7": "P2S"}
+#: seuls ces ports prouvent une imprimante (un simple :80 prenait des routeurs pour des imprimantes)
+PRINTER_PORTS = (7125, 4408, 8883)
+
+
+def parse_bambu_notify(payload):
+    """Annonce SSDP → dict si c'est une imprimante Bambu Lab, sinon None (analyse tolérante)."""
+    text = payload.decode("utf-8", "replace")
+    lines = text.splitlines()
+    if not lines or not lines[0].upper().startswith(("NOTIFY", "HTTP/1.1")):
+        return None
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    blob = " ".join(headers.get(k, "") for k in ("nt", "usn", "server", "location"))
+    if "bambu" not in blob.lower() and not any(k.endswith(".bambu.com") for k in headers):
+        return None
+
+    def h(*names):
+        return next((headers[n] for n in names if headers.get(n)), "")
+    raw = h("devmodel.bambu.com", "devmodel")
+    return {"ip": h("location").replace("http://", "").split(":")[0].strip() or h("host").split(":")[0],
+            "serial": h("usn", "devserial.bambu.com"), "raw_model": raw, "model": BAMBU_MODELS.get(raw, raw),
+            "name": h("devname.bambu.com", "devname"), "signal": h("devsignal.bambu.com"),
+            "connect": h("devconnect.bambu.com").lower(), "bind": h("devbind.bambu.com").lower(),
+            "firmware": h("devversion.bambu.com")}
+
+
+def bambu_sockets():
+    """Sockets d'écoute partagés (Bambu Studio / OrcaSlicer écoutent aussi 2021 : ne pas les bloquer)."""
+    socks = []
+    for port in BAMBU_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        try:
+            s.bind(("", port))
+            mreq = struct.pack("4sl", socket.inet_aton(SSDP_GROUP), socket.INADDR_ANY)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            s.close()
+            continue
+        socks.append(s)
+    return socks
+
+
+def _get_json(url, timeout=4):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            return json.loads(r.read(400000).decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+
+def parse_moonraker(info, sysinfo=None, cfg=None):
+    """Réponses Moonraker → dict (marque devinée prudemment, cinématique, plateau)."""
+    res = (info or {}).get("result", info or {})
+    if not isinstance(res, dict) or not ("software_version" in res or "hostname" in res or "state" in res):
+        return None
+    hostname = str(res.get("hostname") or "")
+    dist = (((sysinfo or {}).get("result") or {}).get("system_info") or {}).get("distribution") or {}
+    distro = str(dist.get("name", ""))
+    settings = ((((cfg or {}).get("result") or {}).get("status") or {}).get("configfile") or {}).get("settings") or {}
+    kin = str((settings.get("printer") or {}).get("kinematics", ""))
+    blob = f"{hostname} {distro}".lower()
+    model = None
+    m = re.search(r"\b(k[12](?:\s?(?:pro|plus|max|c|se))?)\b", hostname.replace("-", " ").lower())
+    if "flsun" in blob:
+        brand = "FLSun"
+        f = re.search(r"(v|t|s|q|sr|super\s?racer)\s?(\d{3})?\s?(max|pro|plus|s)?\b",
+                      hostname.lower().replace("flsun", "").replace("-", " ").strip())
+        if f and (f.group(2) or f.group(1).startswith("s")):
+            model = (f.group(1).upper() + (f.group(2) or "") + (" " + f.group(3).title() if f.group(3) else "")).strip()
+    elif "creality" in blob or m:
+        brand = "Creality"
+        if m:  # « k2pro » / « k2 pro » → « K2 Pro », « k1c » → « K1C »
+            code = m.group(1).replace(" ", "")
+            model = code[:2].upper() + {"pro": " Pro", "plus": " Plus", "max": " Max", "c": "C",
+                                        "se": " SE"}.get(code[2:], "")
+    else:
+        brand = "Klipper"
+    if brand == "Klipper" and "delta" in kin.lower():
+        brand, model = "Klipper (delta)", "delta — FLSun probable"
+    return {"brand": brand, "model": model, "hostname": hostname, "klipper": str(res.get("software_version") or ""),
+            "state": str(res.get("state") or ""), "distro": distro, "kinematics": kin}
+
+
+def moonraker_probe(ip, ports=(7125, 4408, 80)):
+    """Interroge Moonraker (API Klipper) ; :80 n'est accepté que s'il répond comme Moonraker."""
+    for port in ports:
+        base = f"http://{ip}:{port}"
+        info = _get_json(f"{base}/printer/info")
+        if not info:
+            continue
+        r = parse_moonraker(info, _get_json(f"{base}/machine/system_info"),
+                            _get_json(f"{base}/printer/objects/query?configfile"))
+        if r:
+            r["port"] = port
+            return r
+    return None

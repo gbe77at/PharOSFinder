@@ -67,6 +67,7 @@ struct DetailView: View {
         case "unifi": return "wifi.router"
         case "netgear": return "rectangle.connected.to.line.below"
         case "qnap": return "externaldrive.connected.to.line.below"
+        case "printer3d": return "cube.fill"
         default: return "network"
         }
     }
@@ -191,6 +192,9 @@ struct DetailView: View {
             }
             if let r = device.role {
                 infoRow("Rôle", r)
+            }
+            if let p = device.printer3d, !p.summary.isEmpty {
+                infoRow("Imprimante", p.summary)
             }
             infoRow("MAC", device.mac ?? "—", mono: true)
             if let v6 = device.ipv6 {

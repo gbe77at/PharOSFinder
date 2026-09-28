@@ -1,6 +1,12 @@
 # Pharos Finder — macOS et Windows
 
-Découverte et gestion réseau : **TP-Link PharOS** (CPE510, CPE710…), **UniFi**, **NETGEAR**, **QNAP**, **Tuya / Smart Life** et **Amazon** (Echo, Fire TV), plus tout appareil annoncé en Bonjour/mDNS.
+Découverte et gestion réseau : **TP-Link PharOS** (CPE510, CPE710…), **UniFi**, **NETGEAR**, **QNAP**, **imprimantes 3D** (Bambu Lab, Klipper/Moonraker : Creality, FLSun… ; OctoPrint), **Tuya / Smart Life** et **Amazon** (Echo, Fire TV), plus tout appareil annoncé en Bonjour/mDNS.
+
+![Architecture](docs/architecture.svg)
+
+| Déroulé d'une recherche | Build et diffusion |
+|---|---|
+| ![Recherche](docs/recherche.svg) | ![Build](docs/build.svg) |
 
 App native (SwiftUI) pour découvrir les équipements **TP-Link PharOS** (CPE510, CPE710 et les autres CPE/WBS), les rendre joignables et ouvrir leur configuration. Inspirée de Pharos Control et de QNAP Finder.
 
@@ -62,7 +68,8 @@ Un Pharos neuf ou réinitialisé est en **192.168.0.254** sans DHCP. Depuis le W
 | Amazon | fabricant, puis Fire TV (`_amzn-wplay`, port 5555) ou Echo (ports 55442/55443/4070, Spotify Connect) |
 | UniFi | découverte UDP 10001 (modèle, nom, firmware, état d'usine) ; avec le contrôleur : localiser, redémarrer, mettre à jour, adopter |
 | NETGEAR | NSDP UDP 63322/63324 (modèle, nom, IP, DHCP, firmware) ; lecture seule |
-| QNAP | `authLogin.cgi` (modèle, QTS, build, nom) |
+| QNAP | annonce Bonjour `_qdiscover` (port d'accès réel, modèle, QTS, build — comme QNAP Finder) ; `authLogin.cgi` en secours |
+| Imprimantes 3D | Bambu Lab : annonces SSDP UDP 1990/2021 (modèle, série, firmware, mode LAN/cloud) ; Klipper : Moonraker :7125/:4408 (Creality K1/K2, FLSun…) ; OctoPrint : mDNS |
 | Tuya (compte) | noms, types (passerelle, prise, capteur…), capteurs Zigbee/BLE par passerelle, firmware et mise à jour ; aide intégrée (bouton **Comptes**) |
 | Autres | nom Bonjour/mDNS (AirPlay, Chromecast, imprimantes…) |
 

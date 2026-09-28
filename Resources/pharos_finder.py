@@ -722,10 +722,10 @@ def _new_device(key, mac, ip):
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
             "announced": None, "name": None, "services": [], "tuya": None, "unifi": None,
             "netgear": None, "qnap": None, "fw_modules": [], "update_available": False, "role": None,
-            "mdns_ports": {}}
+            "mdns_ports": {}, "printer3d": None}
 
 
-KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "tuya", "amazon", "other")   # ordre d'affichage
+KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "printer3d", "tuya", "amazon", "other")   # ordre d'affichage
 
 
 def classify(d):
@@ -733,6 +733,8 @@ def classify(d):
     vendor = (d.get("vendor") or "").lower()
     if d.get("pharos_hint") or "pharos" in text or (d.get("model") and PHAROS_MODEL_RE.match(d["model"])):
         d["kind"] = "pharos"
+    elif d.get("printer3d"):
+        d["kind"] = "printer3d"
     elif d.get("tuya") or "tuya" in vendor:
         d["kind"] = "tuya"
     elif d.get("unifi") or "ubiquiti" in vendor:
@@ -807,7 +809,7 @@ def fingerprint(dev_id):
         ip4, mac = d["ip"], d["mac"]
         ip = ip4 or d["ipv6"]  # IPv6 link-local quand l'IPv4 est inconnue
     vendor = (vendor_of(mac) or lookup_vendor_online(mac)) if mac else None
-    probe_ports = (22, 80, 443) + (AMAZON_PORTS if vendor and "amazon" in vendor.lower() else ())
+    probe_ports = (22, 80, 443) + fv.PRINTER_PORTS[:2] + (AMAZON_PORTS if vendor and "amazon" in vendor.lower() else ())
     with cf.ThreadPoolExecutor(len(probe_ports)) as ex:
         open_ports = [p for p, ok in zip(probe_ports, ex.map(lambda p: tcp_open(ip, p), probe_ports)) if ok]
     info = {"ports": open_ports, "reachable": bool(open_ports) or ping(ip, 800), "fingerprinted": True}
@@ -826,6 +828,8 @@ def fingerprint(dev_id):
         info["web_local"] = ensure_tunnel(dev_id, ip, 443 if 443 in open_ports else 80)
     if ip4 and vendor and "qnap" in vendor.lower():
         threading.Thread(target=probe_qnap, args=(dev_id,), daemon=True).start()
+    if ip4 and (7125 in open_ports or 4408 in open_ports):
+        probe_printer(dev_id, ip4, open_ports)
     d = upsert(mac=mac, ip=ip4, **info)
     if d:
         label = {"pharos": "PharOS", "tplink": "TP-Link"}.get(d["kind"], "équipement")
@@ -1068,6 +1072,58 @@ def name_hosts(iface):
                 d["role"] = "Routeur (passerelle par défaut)"
                 if not d.get("name"):
                     d["name"] = "Routeur" + (f" · {d['title']}" if d.get("title") else "")
+
+
+def probe_printer(dev_id, ip, open_ports):
+    """Klipper/Moonraker (Creality K1/K2, FLSun, Voron…) : seuls 7125/4408 font preuve."""
+    r = fv.moonraker_probe(ip, ports=tuple(p for p in (7125, 4408) if p in open_ports) + (80,))
+    if not r:
+        return
+    web = f"http://{ip}:4408/" if 4408 in open_ports else (f"http://{ip}/" if 80 in open_ports else None)
+    model = " ".join(filter(None, [r["brand"] if r["brand"] not in ("Klipper",) else None, r["model"]])) \
+        or "Imprimante 3D (Klipper)"
+    upsert(ip=ip, source="Moonraker", name=r["hostname"] or None, model=model, web=web,
+           firmware=f"Klipper {r['klipper']}" if r["klipper"] else None,
+           printer3d={"brand": r["brand"], "state": r["state"], "kinematics": r["kinematics"],
+                      "distro": r["distro"], "api_port": r["port"]})
+    log(f"Imprimante 3D : {model} « {r['hostname'] or '?'} » en {ip} (Klipper {r['state'] or '?'}, "
+        f"Moonraker :{r['port']})", "ok")
+
+
+_BAMBU_SEEN = set()
+
+
+def bambu_listener():
+    """Écoute permanente des annonces SSDP Bambu Lab (UDP 1990/2021), sans droits admin.
+    Rien n'est envoyé à l'imprimante ; ports partagés avec Bambu Studio / OrcaSlicer."""
+    import select
+    socks = fv.bambu_sockets()
+    if not socks:
+        log("Ports Bambu 1990/2021 indisponibles : imprimantes Bambu non détectées.", "warn")
+        return
+    while True:
+        ready, _, _ = select.select(socks, [], [], 5)
+        for s_ in ready:
+            try:
+                data, addr = s_.recvfrom(4096)
+            except OSError:
+                continue
+            b = fv.parse_bambu_notify(data)
+            if not b:
+                continue
+            ip = addr[0]   # l'expéditeur fait foi
+            mode = {"lan": "LAN", "cloud": "cloud"}.get(b["connect"], b["connect"] or "?")
+            d = upsert(ip=ip, source="SSDP Bambu", vendor="Bambu Lab", name=b["name"] or None,
+                       model=f"Bambu Lab {b['model']}" if b["model"] else "Bambu Lab",
+                       firmware=b["firmware"] or None,
+                       printer3d={"brand": "Bambu Lab", "serial": b["serial"], "mode": mode,
+                                  "signal": b["signal"], "bind": b["bind"]})
+            if d and (ip, b["serial"]) not in _BAMBU_SEEN:
+                _BAMBU_SEEN.add((ip, b["serial"]))
+                note = "" if b["connect"] == "lan" else (" · mode cloud : active « LAN Only » et le mode développeur "
+                                                          "sur l'écran de l'imprimante pour la piloter en local")
+                log(f"Imprimante 3D : Bambu Lab {b['model'] or '?'} « {b['name'] or '?'} » en {ip}, "
+                    f"firmware {b['firmware'] or '?'}{note}", "ok")
 
 
 def probe_qnap(dev_id):
@@ -1805,7 +1861,8 @@ def tuya_listener():
 MDNS_SERVICES = ("_amzn-wplay._tcp", "_amzn-alexa._tcp", "_spotify-connect._tcp", "_googlecast._tcp",
                  "_airplay._tcp", "_raop._tcp", "_hap._tcp", "_companion-link._tcp", "_http._tcp",
                  "_ipp._tcp", "_printer._tcp", "_smb._tcp", "_device-info._tcp", "_matter._tcp",
-                 "_sonos._tcp", "_workstation._tcp", "_qdiscover._tcp", "_https._tcp")
+                 "_sonos._tcp", "_workstation._tcp", "_qdiscover._tcp", "_https._tcp",
+                 "_moonraker._tcp", "_octoprint._tcp")
 
 
 def _dns_name(msg, p):
@@ -1827,9 +1884,13 @@ def _dns_name(msg, p):
     return ".".join(labels), (end if jumped else p)
 
 
-def mdns_query_packet(services=MDNS_SERVICES):
-    q = b"".join(b"".join(bytes([len(x)]) + x.encode() for x in (sv + ".local").split(".")) + b"\x00"
-                 + struct.pack("!HH", 12, 0x8001) for sv in services)  # PTR, IN + réponse unicast
+def _qname(name):
+    return b"".join(bytes([len(x.encode())]) + x.encode() for x in name.split(".")) + b"\x00"
+
+
+def mdns_query_packet(services=MDNS_SERVICES, qtype=12):
+    """Requête mDNS (PTR par défaut ; 16 = TXT, 33 = SRV) avec réponse unicast demandée."""
+    q = b"".join(_qname(sv + ".local") + struct.pack("!HH", qtype, 0x8001) for sv in services)
     return struct.pack("!HHHHHH", 0, 0, len(services), 0, 0, 0) + q
 
 
@@ -1881,9 +1942,11 @@ def parse_mdns(msg):
                 ln = msg[q]
                 item = msg[q + 1:q + 1 + ln].decode("utf-8", "ignore")
                 q += 1 + ln
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    kv[k.strip()] = v.strip()
+                # QNAP met tout dans une seule chaîne : « accessType=https,accessPort=51443,… »
+                for part in (item.split(",") if item.count("=") > 1 else [item]):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        kv[k.strip()] = v.strip()
             if svc and kv:
                 out["txt"].setdefault(svc, {}).update(kv)
     return out
@@ -1917,14 +1980,24 @@ def discover_mdns(iface, wait=3.0):
             s_.sendto(pkt, ("224.0.0.251", 5353))
             time.sleep(0.3)
         s_.settimeout(0.5)
-        found, end = {}, time.time() + wait
+        found, end, asked = {}, time.time() + wait, set()
         while time.time() < end:
+            # 2e question : TXT + SRV de chaque instance vue (QNAP ne donne ses infos que sur demande)
+            todo = [f"{inst}.{svc}" for e in found.values() for svc, inst in e.get("inst", [])
+                    if f"{inst}.{svc}" not in asked][:20]
+            if todo:
+                asked.update(todo)
+                s_.sendto(mdns_query_packet(todo, 16), ("224.0.0.251", 5353))
+                s_.sendto(mdns_query_packet(todo, 33), ("224.0.0.251", 5353))
+                end = max(end, time.time() + 1.5)
             try:
                 data, addr = s_.recvfrom(9000)
             except socket.timeout:
                 continue
             r = parse_mdns(data)
-            e = found.setdefault(addr[0], {"names": [], "services": set(), "host": None, "ports": {}, "txt": {}})
+            e = found.setdefault(addr[0], {"names": [], "services": set(), "host": None, "ports": {}, "txt": {},
+                                           "inst": []})
+            e["inst"] += [x for x in r["instances"] if x not in e["inst"]]
             e["services"] |= r["services"]
             e["ports"].update(r["ports"])
             for k, v in r["txt"].items():
@@ -1953,6 +2026,9 @@ def discover_mdns(iface, wait=3.0):
                          model=q.get("displayModel") or q.get("model"),
                          firmware=" ".join(filter(None, [q.get("fwVer"),
                                                          f"build {q['fwBuildNum']}" if q.get("fwBuildNum") else None])) or None)
+        if "_octoprint._tcp" in e["services"]:
+            extra["printer3d"] = {"brand": "OctoPrint", "via": "mDNS"}
+            extra.setdefault("model", "Imprimante 3D (OctoPrint)")
         d = upsert(mac=macs.get(ip), ip=ip, source="mDNS", name=name, services=sorted(e["services"]),
                    mdns_ports=e["ports"], **extra)
         if d and d["kind"] == "amazon" and d.get("fingerprinted"):
@@ -2688,6 +2764,7 @@ def main():
     atexit.register(cleanup_vlans)
     threading.Thread(target=announcement_sniffer, daemon=True).start()
     threading.Thread(target=tuya_listener, daemon=True).start()
+    threading.Thread(target=bambu_listener, daemon=True).start()
     load_accounts()
 
     def _sig(*_):
@@ -2776,7 +2853,7 @@ tr.row{cursor:pointer;background:var(--panel)}
 tr.row:hover{background:var(--panel2)}
 tr.row.sel{background:var(--sel)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--other)}
-.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)} .dot.tuya{background:#f97316} .dot.amazon{background:#6366f1} .dot.unifi{background:#0ea5e9} .dot.netgear{background:#7c3aed} .dot.qnap{background:#0891b2}
+.dot.pharos{background:var(--pharos)} .dot.tplink{background:var(--tplink)} .dot.tuya{background:#f97316} .dot.amazon{background:#6366f1} .dot.unifi{background:#0ea5e9} .dot.netgear{background:#7c3aed} .dot.qnap{background:#0891b2} .dot.printer3d{background:#db2777}
 .tag.upd{color:var(--ok);border-color:currentColor}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:10}
 #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:min(760px,94vw);max-height:90vh;overflow:auto;padding:18px}
@@ -2850,7 +2927,7 @@ footer .bar{display:flex;align-items:center;gap:10px;padding:5px 16px;border-bot
   <button class="danger" id="btnStop" disabled>Stop</button>
   <div class="spacer"></div>
   <div class="seg" id="filter">
-    <button data-f="all" class="on">Tous</button><button data-f="pharos">PharOS</button><button data-f="tplink">TP-Link</button><button data-f="unifi">UniFi</button><button data-f="netgear">NETGEAR</button><button data-f="qnap">QNAP</button><button data-f="tuya">Tuya</button><button data-f="amazon">Amazon</button>
+    <button data-f="all" class="on">Tous</button><button data-f="pharos">PharOS</button><button data-f="tplink">TP-Link</button><button data-f="unifi">UniFi</button><button data-f="netgear">NETGEAR</button><button data-f="qnap">QNAP</button><button data-f="printer3d">Imprimantes 3D</button><button data-f="tuya">Tuya</button><button data-f="amazon">Amazon</button>
   </div>
 </div>
 
@@ -2885,7 +2962,7 @@ async function api(path, body){
   if(!r.ok){ toast(j.error || 'Erreur'); throw new Error(j.error); }
   refresh(); return j;
 }
-const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', unifi:'UniFi', netgear:'NETGEAR', qnap:'QNAP', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
+const KIND_LABEL = {pharos:'PharOS', tplink:'TP-Link', unifi:'UniFi', netgear:'NETGEAR', qnap:'QNAP', printer3d:'Imprimante 3D', tuya:'Tuya / Smart Life', amazon:'Amazon', other:'Équipement'};
 function displayName(d){
   if(d.kind === 'pharos') return d.model || 'PharOS';
   return d.name || d.model || d.title || (d.kind === 'other' ? (d.vendor && !d.vendor.startsWith('MAC locale') ? d.vendor : 'Équipement') : KIND_LABEL[d.kind]);
@@ -2991,6 +3068,7 @@ function renderDetail(){
       <dt>Type</dt><dd>${esc(kindLbl)}${d.model && displayName(d) !== d.model ? ' · ' + esc(d.model) : ''}</dd>
       ${d.name ? `<dt>Nom</dt><dd>${esc(d.name)}</dd>` : ''}
       ${d.role ? `<dt>Rôle</dt><dd>${esc(d.role)}</dd>` : ''}
+      ${d.printer3d ? `<dt>Imprimante</dt><dd>${esc([d.printer3d.brand, d.printer3d.state && 'Klipper ' + d.printer3d.state, d.printer3d.mode && 'mode ' + d.printer3d.mode, d.printer3d.serial && 'n° ' + d.printer3d.serial].filter(Boolean).join(' · '))}</dd>` : ''}
       <dt>Fabricant</dt><dd>${esc(d.vendor || 'inconnu')}</dd>
       ${d.tuya ? `<dt>ID Tuya</dt><dd class="mono">${esc(d.tuya.gw_id || '—')}</dd><dt>Produit</dt><dd class="mono">${esc(d.tuya.product_key || '—')} · v${esc(d.tuya.version)}</dd>` : ''}
       ${(d.services||[]).length ? `<dt>Services</dt><dd>${esc(d.services.join(', '))}</dd>` : ''}

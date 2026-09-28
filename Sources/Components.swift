@@ -10,6 +10,7 @@ extension Device {
         case "unifi": return .cyan
         case "netgear": return .purple
         case "qnap": return .mint
+        case "printer3d": return .pink
         default: return .gray
         }
     }

@@ -240,3 +240,65 @@ class EngineIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BAMBU_NOTIFY = (b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nServer: UPnP/1.0\r\nLocation: 10.10.10.77\r\n"
+                b"NT: urn:bambulab-com:device:3dprinter:1\r\nUSN: 22E8BJ5B1001755\r\nCache-Control: max-age=1800\r\n"
+                b"DevModel.bambu.com: N7\r\nDevName.bambu.com: P2S\r\nDevSignal.bambu.com: -45\r\n"
+                b"DevConnect.bambu.com: cloud\r\nDevBind.bambu.com: occupied\r\nDevVersion.bambu.com: 01.02.00.00\r\n\r\n")
+
+
+class Printer3DTests(unittest.TestCase):
+    def test_bambu_notify(self):
+        b = fv.parse_bambu_notify(BAMBU_NOTIFY)
+        self.assertEqual((b["ip"], b["serial"], b["model"], b["connect"], b["firmware"]),
+                         ("10.10.10.77", "22E8BJ5B1001755", "P2S", "cloud", "01.02.00.00"))
+
+    def test_unknown_code_kept_verbatim(self):
+        b = fv.parse_bambu_notify(BAMBU_NOTIFY.replace(b"N7", b"Z9"))
+        self.assertEqual(b["model"], "Z9")
+
+    def test_other_ssdp_ignored(self):
+        self.assertIsNone(fv.parse_bambu_notify(b"NOTIFY * HTTP/1.1\r\nNT: upnp:rootdevice\r\nUSN: uuid:x\r\n"))
+
+    def test_moonraker(self):
+        r = fv.parse_moonraker({"result": {"hostname": "K2Pro-EB11", "software_version": "09faed31-dirty",
+                                           "state": "ready"}},
+                               {"result": {"system_info": {"distribution": {"name": "OpenWrt 21.02"}}}})
+        self.assertEqual((r["brand"], r["model"], r["state"], r["distro"]),
+                         ("Creality", "K2 Pro", "ready", "OpenWrt 21.02"))
+        delta = fv.parse_moonraker({"result": {"hostname": "printer"}}, None,
+                                   {"result": {"status": {"configfile": {"settings": {"printer": {"kinematics": "delta"}}}}}})
+        self.assertEqual(delta["brand"], "Klipper (delta)")
+        self.assertIsNone(fv.parse_moonraker({"result": {"foo": 1}}))
+
+    def test_printer_kind_wins_over_module_vendor(self):
+        pf.DEVICES.clear()
+        pf.upsert(mac="60:32:3b:e9:c7:3a", ip="10.10.10.77")   # module Wi-Fi Quectel
+        d = pf.upsert(ip="10.10.10.77", source="SSDP Bambu", model="Bambu Lab P2S",
+                      printer3d={"brand": "Bambu Lab", "mode": "cloud"})
+        self.assertEqual((d["kind"], d["mac"]), ("printer3d", "60:32:3b:e9:c7:3a"))
+
+
+class RealWorldTests(unittest.TestCase):
+    """Valeurs relevées sur le réseau de l'auteur (2026-09-28)."""
+
+    def test_qnap_txt_single_string(self):
+        inst = "NAS-TVS882T._qdiscover._tcp.local"
+        txt = b"accessType=https,accessPort=51443,model=TS-X82,displayModel=TVS-882T,fwVer=5.2.10,fwBuildNum=20260731"
+        rr = dns_name(inst) + struct.pack("!HHIH", 16, 0x8001, 120, len(txt) + 1) + bytes([len(txt)]) + txt
+        r = pf.parse_mdns(struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + rr)
+        q = r["txt"]["_qdiscover._tcp"]
+        self.assertEqual((q["accessPort"], q["displayModel"], q["fwVer"]), ("51443", "TVS-882T", "5.2.10"))
+        self.assertEqual(pf.web_from_mdns("10.10.10.5", {"_qdiscover._tcp": 51080}, r["txt"]),
+                         "https://10.10.10.5:51443/")
+
+    def test_flsun_hostname(self):
+        r = fv.parse_moonraker({"result": {"hostname": "FLSunV400Max", "state": "ready"}},
+                               {"result": {"system_info": {"distribution": {"name": "Debian GNU/Linux 10 (buster)"}}}},
+                               {"result": {"status": {"configfile": {"settings": {"printer": {"kinematics": "delta"}}}}}})
+        self.assertEqual((r["brand"], r["model"], r["kinematics"]), ("FLSun", "V400 Max", "delta"))
+
+    def test_mdns_query_types(self):
+        pkt = pf.mdns_query_packet(["NAS-TVS882T._qdiscover._tcp"], 16)
+        self.assertTrue(pkt.endswith(struct.pack("!HH", 16, 0x8001)))

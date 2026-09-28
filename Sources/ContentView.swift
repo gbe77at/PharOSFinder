@@ -7,6 +7,7 @@ enum DeviceFilter: String, CaseIterable, Identifiable {
     case unifi = "UniFi"
     case netgear = "NETGEAR"
     case qnap = "QNAP"
+    case printer3d = "Imprimantes 3D"
     case tuya = "Tuya"
     case amazon = "Amazon"
     var id: String { rawValue }
@@ -35,6 +36,7 @@ struct ContentView: View {
                 case .unifi: return d.kind == "unifi"
                 case .netgear: return d.kind == "netgear"
                 case .qnap: return d.kind == "qnap"
+                case .printer3d: return d.kind == "printer3d"
                 case .all: return true
                 }
             }

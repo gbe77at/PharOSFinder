@@ -47,6 +47,20 @@ struct UniFiInfo: Decodable, Hashable {
     var latest: String?
 }
 
+struct Printer3DInfo: Decodable, Hashable {
+    var brand: String?
+    var state: String?
+    var mode: String?
+    var serial: String?
+    var kinematics: String?
+    var signal: String?
+
+    var summary: String {
+        [brand, state.map { "Klipper \($0)" }, mode.map { "mode \($0)" }, serial.map { "n° \($0)" }]
+            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+}
+
 struct NetgearInfo: Decodable, Hashable {
     var dhcp: Bool?
     var firmware2: String?
@@ -112,6 +126,7 @@ struct Device: Decodable, Identifiable, Hashable {
     var updateAvailable: Bool?
     var actions: [DeviceAction]?
     var role: String?
+    var printer3d: Printer3DInfo?
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }
@@ -135,6 +150,7 @@ struct Device: Decodable, Identifiable, Hashable {
         case "unifi": return "UniFi"
         case "netgear": return "NETGEAR"
         case "qnap": return "QNAP"
+        case "printer3d": return "Imprimante 3D"
         default: return "Autre"
         }
     }
@@ -150,6 +166,7 @@ struct Device: Decodable, Identifiable, Hashable {
         case "unifi": return "Équipement UniFi"
         case "netgear": return "Équipement NETGEAR"
         case "qnap": return "NAS QNAP"
+        case "printer3d": return "Imprimante 3D"
         default: return "Identification partielle"
         }
     }

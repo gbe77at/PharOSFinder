@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 880" width="1200" height="880" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Pharos Finder — architecture</title>
+  <style>
+    .bg{fill:#ffffff} .ink{fill:#1f2328} .muted{fill:#59636e}
+    .zone{fill:#f6f8fa;stroke:#d1d9e0} .box{fill:#ffffff;stroke:#d1d9e0}
+    .ui{fill:#ddf4ff;stroke:#54aeff} .eng{fill:#fff8c5;stroke:#d4a72c} .ven{fill:#fbefff;stroke:#c297ff}
+    .net{fill:#dafbe1;stroke:#4ac26b} .cloud{fill:#ffebe9;stroke:#ff8182}
+    .line{stroke:#59636e;fill:none;stroke-width:1.6} .arrow{fill:#59636e}
+    @media (prefers-color-scheme: dark){
+      .bg{fill:#0d1117} .ink{fill:#e6edf3} .muted{fill:#9198a1}
+      .zone{fill:#151b23;stroke:#3d444d} .box{fill:#0d1117;stroke:#3d444d}
+      .ui{fill:#0c2d4a;stroke:#1f6feb} .eng{fill:#3b2e05;stroke:#9e6a03} .ven{fill:#2d1a4a;stroke:#8957e5}
+      .net{fill:#0f3320;stroke:#2ea043} .cloud{fill:#4a1418;stroke:#da3633}
+      .line{stroke:#9198a1} .arrow{fill:#9198a1}
+    }
+    text{font-size:13px} .h1{font-size:22px;font-weight:700} .h2{font-size:15px;font-weight:700} .sm{font-size:11.5px}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="arrow" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1200" height="880"/>
+  <text class="ink h1" x="32" y="42">Pharos Finder — architecture</text>
+  <text class="muted" x="32" y="64">Un moteur Python unique (stdlib) piloté par l'app macOS ou par son interface web intégrée (Windows, Linux).</text>
+
+  <rect class="zone" x="32" y="86" width="1136" height="150" rx="10"/>
+  <text class="muted h2" x="48" y="110">Interfaces</text>
+  <rect class="ui" x="48" y="122" width="540" height="100" rx="8"/>
+  <text class="ink h2" x="64" y="146">App macOS (SwiftUI, universelle arm64 + x86_64)</text>
+  <text class="ink sm" x="64" y="168">ContentView (tableau, filtres, tri) · DetailView (fiche, actions de gestion)</text>
+  <text class="ink sm" x="64" y="186">AccountsView (comptes + aide) · Engine.swift (lancement, sondage 1 s)</text>
+  <text class="muted sm" x="64" y="206">Mot de passe admin (NSAppleScript) · identifiants dans le trousseau macOS</text>
+  <rect class="ui" x="612" y="122" width="540" height="100" rx="8"/>
+  <text class="ink h2" x="628" y="146">Interface web intégrée (PC Windows, Linux, DGX Spark)</text>
+  <text class="ink sm" x="628" y="168">Servie par le moteur sur /?t=&lt;jeton&gt; · mêmes fonctions que l'app</text>
+  <text class="ink sm" x="628" y="186">PharosFinder.exe (PyInstaller, élévation UAC) ou sudo python3</text>
+  <text class="muted sm" x="628" y="206">Comptes en mémoire, ou fichier 0600 si « mémoriser »</text>
+
+  <line class="line" x1="318" y1="222" x2="318" y2="286" marker-end="url(#a)"/>
+  <line class="line" x1="882" y1="222" x2="882" y2="286" marker-end="url(#a)"/>
+  <text class="muted sm" x="330" y="258">HTTP 127.0.0.1:&lt;port&gt; · en-tête X-Token</text>
+  <text class="muted sm" x="894" y="258">même API · jeton dans l'URL</text>
+
+  <rect class="zone" x="32" y="288" width="1136" height="372" rx="10"/>
+  <text class="muted h2" x="48" y="312">Moteur — Resources/pharos_finder.py (root / administrateur ; mode limité sinon)</text>
+
+  <rect class="eng" x="48" y="326" width="262" height="140" rx="8"/>
+  <text class="ink h2" x="62" y="350">API &amp; état</text>
+  <text class="ink sm" x="62" y="372">/api/state · scan · listen · reach</text>
+  <text class="ink sm" x="62" y="390">watch · vlan · account · sync · action</text>
+  <text class="ink sm" x="62" y="408">Tâches nommées (une à la fois)</text>
+  <text class="ink sm" x="62" y="426">Journal · alias IP · conflits d'adresse</text>
+  <text class="muted sm" x="62" y="450">Arrêt si l'app disparaît (--parent-pid)</text>
+
+  <rect class="eng" x="324" y="326" width="262" height="140" rx="8"/>
+  <text class="ink h2" x="338" y="350">Découverte</text>
+  <text class="ink sm" x="338" y="372">Balayage ping + ARP par interface</text>
+  <text class="ink sm" x="338" y="390">Plages d'usine via alias temporaire</text>
+  <text class="ink sm" x="338" y="408">mDNS (PTR, SRV, TXT) · IPv6 link-local</text>
+  <text class="ink sm" x="338" y="426">Écoute passive · VLAN de gestion</text>
+  <text class="muted sm" x="338" y="450">Relais web IPv6 · alias « Rendre joignable »</text>
+
+  <rect class="eng" x="600" y="326" width="262" height="140" rx="8"/>
+  <text class="ink h2" x="614" y="350">Identification</text>
+  <text class="ink sm" x="614" y="372">Registre IEEE embarqué (40 250 OUI)</text>
+  <text class="ink sm" x="614" y="390">Ports, page web, bannière SSH</text>
+  <text class="ink sm" x="614" y="408">Annonces CDP / LLDP (IP, modèle, fw)</text>
+  <text class="ink sm" x="614" y="426">Noms DNS inverses · passerelle</text>
+  <text class="muted sm" x="614" y="450">9 types : pharos, unifi, printer3d, tuya…</text>
+
+  <rect class="eng" x="876" y="326" width="276" height="140" rx="8"/>
+  <text class="ink h2" x="890" y="350">Écoutes permanentes</text>
+  <text class="ink sm" x="890" y="372">CDP / LLDP sur chaque interface (root)</text>
+  <text class="ink sm" x="890" y="390">Tuya UDP 6666 · 6667 · 7000 (AES pur)</text>
+  <text class="ink sm" x="890" y="408">Bambu Lab SSDP UDP 1990 · 2021</text>
+  <text class="ink sm" x="890" y="426">(ports partagés avec Bambu Studio)</text>
+  <text class="muted sm" x="890" y="450">Sans aucune action de l'utilisateur</text>
+
+  <rect class="ven" x="48" y="482" width="1104" height="162" rx="8"/>
+  <text class="ink h2" x="62" y="506">Resources/finder_vendors.py — protocoles constructeurs (sans dépendance au moteur)</text>
+  <rect class="box" x="62" y="518" width="206" height="112" rx="6"/>
+  <text class="ink h2" x="74" y="540">UniFi</text>
+  <text class="ink sm" x="74" y="560">Découverte UDP 10001</text>
+  <text class="ink sm" x="74" y="578">Contrôleur Network :</text>
+  <text class="ink sm" x="74" y="596">localiser, redémarrer,</text>
+  <text class="ink sm" x="74" y="614">mettre à jour, adopter</text>
+  <rect class="box" x="280" y="518" width="206" height="112" rx="6"/>
+  <text class="ink h2" x="292" y="540">NETGEAR</text>
+  <text class="ink sm" x="292" y="560">NSDP UDP 63322 / 63324</text>
+  <text class="ink sm" x="292" y="578">Modèle, nom, IP, DHCP,</text>
+  <text class="ink sm" x="292" y="596">firmware</text>
+  <text class="ink sm" x="292" y="614">Lecture seule</text>
+  <rect class="box" x="498" y="518" width="206" height="112" rx="6"/>
+  <text class="ink h2" x="510" y="540">QNAP</text>
+  <text class="ink sm" x="510" y="560">Annonce _qdiscover (TXT)</text>
+  <text class="ink sm" x="510" y="578">port d'accès, modèle,</text>
+  <text class="ink sm" x="510" y="596">QTS + build</text>
+  <text class="ink sm" x="510" y="614">authLogin.cgi en secours</text>
+  <rect class="box" x="716" y="518" width="206" height="112" rx="6"/>
+  <text class="ink h2" x="728" y="540">Imprimantes 3D</text>
+  <text class="ink sm" x="728" y="560">Bambu Lab : SSDP</text>
+  <text class="ink sm" x="728" y="578">Klipper : Moonraker</text>
+  <text class="ink sm" x="728" y="596">:7125 / :4408 (Creality,</text>
+  <text class="ink sm" x="728" y="614">FLSun) · OctoPrint mDNS</text>
+  <rect class="box" x="934" y="518" width="204" height="112" rx="6"/>
+  <text class="ink h2" x="946" y="540">Tuya OpenAPI</text>
+  <text class="ink sm" x="946" y="560">Signature HMAC-SHA256</text>
+  <text class="ink sm" x="946" y="578">Noms, types, capteurs</text>
+  <text class="ink sm" x="946" y="596">Zigbee / BLE</text>
+  <text class="ink sm" x="946" y="614">Firmware et mise à jour</text>
+
+  <line class="line" x1="600" y1="660" x2="600" y2="710" marker-end="url(#a)"/>
+  <line class="line" x1="1036" y1="644" x2="1036" y2="710" marker-end="url(#a)"/>
+
+  <rect class="net" x="32" y="712" width="740" height="140" rx="10"/>
+  <text class="ink h2" x="48" y="738">Réseau local</text>
+  <text class="ink sm" x="48" y="762">TP-Link PharOS (CPE510, CPE710…) · UniFi (U6-LR) · NETGEAR (GS516TP, GS108PEv3) · QNAP (TVS-882T)</text>
+  <text class="ink sm" x="48" y="782">Bambu Lab P2S · FLSun V400 Max · Creality K2 Pro · Tuya / Smart Life · Amazon Echo, Fire TV</text>
+  <text class="muted sm" x="48" y="810">ARP, ICMP, HTTP(S), SSH, CDP, LLDP, mDNS, SSDP, UDP 10001, NSDP, Tuya 6666-7000, Moonraker, IPv6 ND</text>
+  <text class="muted sm" x="48" y="830">Aucune donnée ne sort du réseau local sans compte configuré.</text>
+
+  <rect class="cloud" x="796" y="712" width="372" height="140" rx="10"/>
+  <text class="ink h2" x="812" y="738">Services externes (optionnels)</text>
+  <text class="ink sm" x="812" y="762">Cloud Tuya (région du projet)</text>
+  <text class="ink sm" x="812" y="782">Contrôleur UniFi Network (local)</text>
+  <text class="ink sm" x="812" y="802">api.macvendors.com (secours du registre)</text>
+  <text class="muted sm" x="812" y="830">Identifiants fournis par l'utilisateur</text>
+</svg>

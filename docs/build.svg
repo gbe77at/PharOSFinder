@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="1200" height="520" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Pharos Finder — build et diffusion</title>
+  <style>
+    .bg{fill:#ffffff} .ink{fill:#1f2328} .muted{fill:#59636e}
+    .zone{fill:#f6f8fa;stroke:#d1d9e0} .src{fill:#fff8c5;stroke:#d4a72c} .mac{fill:#ddf4ff;stroke:#54aeff}
+    .ci{fill:#fbefff;stroke:#c297ff} .out{fill:#dafbe1;stroke:#4ac26b}
+    .line{stroke:#59636e;fill:none;stroke-width:1.6} .arrow{fill:#59636e}
+    @media (prefers-color-scheme: dark){
+      .bg{fill:#0d1117} .ink{fill:#e6edf3} .muted{fill:#9198a1}
+      .zone{fill:#151b23;stroke:#3d444d} .src{fill:#3b2e05;stroke:#9e6a03} .mac{fill:#0c2d4a;stroke:#1f6feb}
+      .ci{fill:#2d1a4a;stroke:#8957e5} .out{fill:#0f3320;stroke:#2ea043}
+      .line{stroke:#9198a1} .arrow{fill:#9198a1}
+    }
+    text{font-size:13px} .h1{font-size:22px;font-weight:700} .h2{font-size:14.5px;font-weight:700} .sm{font-size:11.5px}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="arrow" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1200" height="520"/>
+  <text class="ink h1" x="32" y="42">Build et diffusion</text>
+  <text class="muted" x="32" y="64">Aucune dépendance externe : swiftc + bibliothèque standard Python. Même moteur sur les trois systèmes.</text>
+
+  <rect class="src" x="32" y="96" width="260" height="190" rx="8"/>
+  <text class="ink h2" x="46" y="120">Sources</text>
+  <text class="ink sm" x="46" y="144">Sources/*.swift (app macOS)</text>
+  <text class="ink sm" x="46" y="164">Resources/pharos_finder.py</text>
+  <text class="ink sm" x="46" y="184">Resources/finder_vendors.py</text>
+  <text class="ink sm" x="46" y="204">Resources/oui.txt.gz (IEEE)</text>
+  <text class="ink sm" x="46" y="224">Resources/AppIcon.iconset</text>
+  <text class="ink sm" x="46" y="244">tests/ (unitaires + fumée)</text>
+  <text class="muted sm" x="46" y="270">tools/update_oui.py régénère le registre</text>
+
+  <line class="line" x1="292" y1="150" x2="340" y2="150" marker-end="url(#a)"/>
+  <line class="line" x1="292" y1="236" x2="340" y2="330" marker-end="url(#a)"/>
+
+  <rect class="mac" x="342" y="96" width="400" height="120" rx="8"/>
+  <text class="ink h2" x="356" y="120">build.sh (sur un Mac)</text>
+  <text class="ink sm" x="356" y="144">swiftc arm64 + x86_64 → lipo (universel)</text>
+  <text class="ink sm" x="356" y="164">Info.plist · iconutil · codesign ad hoc</text>
+  <text class="ink sm" x="356" y="184">moteur + registre copiés dans Resources/</text>
+  <text class="muted sm" x="356" y="204">écarte un ancien build contenant des fichiers root</text>
+  <line class="line" x1="742" y1="156" x2="790" y2="156" marker-end="url(#a)"/>
+  <rect class="out" x="792" y="96" width="376" height="120" rx="8"/>
+  <text class="ink h2" x="806" y="120">build/PharosFinder.dmg</text>
+  <text class="ink sm" x="806" y="144">« Pharos Finder.app » universelle</text>
+  <text class="ink sm" x="806" y="164">macOS 13+ · Python 3.8+ détecté</text>
+  <text class="ink sm" x="806" y="184">(Homebrew, python.org, conda, CLT)</text>
+  <text class="muted sm" x="806" y="204">non notarisée : clic droit → Ouvrir</text>
+
+  <rect class="zone" x="342" y="244" width="826" height="250" rx="10"/>
+  <text class="muted h2" x="356" y="268">GitHub Actions — .github/workflows/build.yml (push, PR, tag v*)</text>
+  <rect class="ci" x="356" y="282" width="256" height="196" rx="8"/>
+  <text class="ink h2" x="370" y="306">test (matrice)</text>
+  <text class="ink sm" x="370" y="330">macOS · Windows</text>
+  <text class="ink sm" x="370" y="350">Linux x64 · Linux ARM64</text>
+  <text class="ink sm" x="370" y="376">tests unitaires (70)</text>
+  <text class="ink sm" x="370" y="396">test de fumée : vrai moteur,</text>
+  <text class="ink sm" x="370" y="416">interfaces, balayage, arrêt</text>
+  <text class="muted sm" x="370" y="446">vérifie aussi le registre IEEE</text>
+  <line class="line" x1="612" y1="330" x2="640" y2="330" marker-end="url(#a)"/>
+  <line class="line" x1="612" y1="430" x2="640" y2="430" marker-end="url(#a)"/>
+  <rect class="ci" x="642" y="282" width="256" height="92" rx="8"/>
+  <text class="ink h2" x="656" y="306">windows</text>
+  <text class="ink sm" x="656" y="328">PyInstaller --onefile --console</text>
+  <text class="ink sm" x="656" y="346">+ oui.txt.gz · test de fumée de l'exe</text>
+  <text class="muted sm" x="656" y="364">PharosFinder-Windows.zip</text>
+  <rect class="ci" x="642" y="386" width="256" height="92" rx="8"/>
+  <text class="ink h2" x="656" y="410">macos</text>
+  <text class="ink sm" x="656" y="432">./build.sh sur macos-latest</text>
+  <text class="muted sm" x="656" y="462">PharosFinder.dmg</text>
+  <line class="line" x1="898" y1="380" x2="926" y2="380" marker-end="url(#a)"/>
+  <rect class="out" x="928" y="282" width="226" height="196" rx="8"/>
+  <text class="ink h2" x="942" y="306">release (tag v*)</text>
+  <text class="ink sm" x="942" y="330">Release GitHub avec :</text>
+  <text class="ink sm" x="942" y="350">· PharosFinder-Windows.zip</text>
+  <text class="ink sm" x="942" y="370">  (exe + LISEZMOI.txt)</text>
+  <text class="ink sm" x="942" y="390">· PharosFinder.dmg</text>
+  <text class="muted sm" x="942" y="446">sinon : artefacts de l'exécution</text>
+
+  <rect class="out" x="32" y="310" width="296" height="184" rx="8"/>
+  <text class="ink h2" x="46" y="334">Linux (DGX Spark, Raspberry Pi)</text>
+  <text class="ink sm" x="46" y="358">sudo python3 Resources/pharos_finder.py</text>
+  <text class="ink sm" x="46" y="378">interfaces : ip -j addr</text>
+  <text class="ink sm" x="46" y="398">écoute : tcpdump ou AF_PACKET</text>
+  <text class="ink sm" x="46" y="418">interface web dans le navigateur</text>
+  <text class="muted sm" x="46" y="446">testé en CI sur x64 et ARM64</text>
+</svg>
