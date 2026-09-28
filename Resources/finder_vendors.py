@@ -217,10 +217,13 @@ def parse_qnap_xml(text):
         m = re.search(rf"<{name}>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</{name}>", text, re.S | re.I)
         return m.group(1).strip() if m else None
     model = tag("displayModelName") or tag("modelName")
-    if not model:
+    if not model and not tag("webAccessPort"):   # QTS 5 ne donne plus le modèle sans connexion
         return None
+    port, sport = tag("webAccessPort"), tag("stunnelPort")
     return {"model": model, "internal_model": tag("internalModelName"), "firmware": tag("version"),
-            "build": tag("build"), "hostname": tag("hostname"), "platform": tag("platform")}
+            "build": tag("build"), "hostname": tag("hostname"), "platform": tag("platform"),
+            "http_port": int(port) if port and port.isdigit() else None,
+            "https_port": int(sport) if sport and sport.isdigit() and tag("stunnelEnabled") != "0" else None}
 
 
 def qnap_probe(ip, timeout=4, first=None):

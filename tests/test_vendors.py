@@ -302,3 +302,35 @@ class RealWorldTests(unittest.TestCase):
     def test_mdns_query_types(self):
         pkt = pf.mdns_query_packet(["NAS-TVS882T._qdiscover._tcp"], 16)
         self.assertTrue(pkt.endswith(struct.pack("!HH", 16, 0x8001)))
+
+
+class QnapLinkTests(unittest.TestCase):
+    def test_http_link_from_announce(self):
+        ports = {"_qdiscover._tcp": 51080}
+        txt = {"_qdiscover._tcp": {"accessType": "https", "accessPort": "51443"}}
+        self.assertEqual(pf.web_from_mdns("10.10.10.5", ports, txt), "https://10.10.10.5:51443/")
+        self.assertEqual(pf.http_from_mdns("10.10.10.5", ports, txt), "http://10.10.10.5:51080/")
+
+    def test_qts5_xml_ports(self):
+        xml = ("<QDocRoot><hostname><![CDATA[NAS-TVS882T]]></hostname><webAccessPort><![CDATA[51080]]></webAccessPort>"
+               "<stunnelEnabled><![CDATA[1]]></stunnelEnabled><stunnelPort><![CDATA[51443]]></stunnelPort></QDocRoot>")
+        q = fv.parse_qnap_xml(xml)
+        self.assertEqual((q["http_port"], q["https_port"], q["hostname"], q["model"]), (51080, 51443, "NAS-TVS882T", None))
+
+
+class ProbeQnapMergeTests(unittest.TestCase):
+    def test_qts5_keeps_bonjour_identity(self):
+        pf.DEVICES.clear()
+        pf.upsert(mac="24:5e:be:1a:1f:af", ip="10.10.10.5", model="TVS-882T", firmware="5.2.10 build 20260731",
+                  web="https://10.10.10.5:51443/", qnap={"mdns": {"accessPort": "51443"}})
+        orig = fv.qnap_probe
+        fv.qnap_probe = lambda ip, **k: {"model": None, "firmware": None, "build": None, "hostname": "NAS-TVS882T",
+                                         "http_port": 51080, "https_port": 51443, "web": "http://10.10.10.5:51080/"}
+        try:
+            pf.probe_qnap("24:5e:be:1a:1f:af")
+        finally:
+            fv.qnap_probe = orig
+        d = pf.DEVICES["24:5e:be:1a:1f:af"]
+        self.assertEqual((d["model"], d["firmware"], d["web"], d["web_http"]),
+                         ("TVS-882T", "5.2.10 build 20260731", "https://10.10.10.5:51443/", "http://10.10.10.5:51080/"))
+        self.assertIn("mdns", d["qnap"])

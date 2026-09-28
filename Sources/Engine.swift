@@ -261,11 +261,8 @@ final class Engine: ObservableObject {
     func action(_ d: Device, _ id: String) { post("action", ["id": d.id, "action": id]) }
 
     func openWeb(_ d: Device, https: Bool) {
-        // IPv4 inconnue : le moteur relaie l'interface web via IPv6 sur 127.0.0.1.
-        // QNAP & co : l'adresse exacte (port 8080…) vient du moteur.
-        let known = https && d.webLocal == nil ? d.web.flatMap { $0.hasPrefix("http") ? $0 : nil } : nil
-        let target = known ?? d.ip.map { "\(https ? "https" : "http")://\($0)/" } ?? d.webLocal
-        guard let t = target, let url = URL(string: t) else { return }
+        // Adresses fournies par le moteur (ports annoncés par l'équipement, relais IPv6…).
+        guard let t = https ? d.httpsURL : d.httpURL, let url = URL(string: t) else { return }
         NSWorkspace.shared.open(url)
     }
 

@@ -127,6 +127,20 @@ struct Device: Decodable, Identifiable, Hashable {
     var actions: [DeviceAction]?
     var role: String?
     var printer3d: Printer3DInfo?
+    var webHttp: String?
+
+    /// Liens d'accès : ceux annoncés par l'équipement (QNAP :51443 / :51080…), sinon ports standard.
+    var httpsURL: String? {
+        if let w = web, webLocal == nil, w.hasPrefix("https") { return w }
+        if ip == nil { return webLocal }
+        if let w = web, webLocal == nil { return w }
+        return ip.map { "https://\($0)/" }
+    }
+    var httpURL: String? {
+        if let h = webHttp { return h }
+        if let w = web, w.hasPrefix("http:") { return w }
+        return ip.map { "http://\($0)/" }
+    }
 
     /// Adresse pour SSH : IPv4, sinon IPv6 link-local (fe80::…%en11).
     var sshAddress: String? { ip ?? ipv6 }

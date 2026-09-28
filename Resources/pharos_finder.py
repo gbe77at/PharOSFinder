@@ -722,7 +722,7 @@ def _new_device(key, mac, ip):
             "fingerprinted": False, "ipv6": None, "web_local": None, "firmware": None,
             "announced": None, "name": None, "services": [], "tuya": None, "unifi": None,
             "netgear": None, "qnap": None, "fw_modules": [], "update_available": False, "role": None,
-            "mdns_ports": {}, "printer3d": None}
+            "mdns_ports": {}, "printer3d": None, "web_http": None}
 
 
 KINDS = ("pharos", "tplink", "unifi", "netgear", "qnap", "printer3d", "tuya", "amazon", "other")   # ordre d'affichage
@@ -1127,16 +1127,32 @@ def bambu_listener():
 
 
 def probe_qnap(dev_id):
+    """authLogin.cgi : ports d'accès (webAccessPort / stunnelPort) et, avant QTS 5, modèle et firmware.
+    Ne remplace jamais par du vide ce que l'annonce Bonjour a déjà donné."""
     with LOCK:
         d = DEVICES.get(dev_id)
-        ip = d["ip"] if d else None
-    announced = d.get("web") if d else None
-    info = fv.qnap_probe(ip, first=announced) if ip else None
-    if info:
-        upsert(mac=d["mac"], ip=ip, source="QNAP", model=info["model"], vendor="QNAP",
-               firmware=" ".join(filter(None, [info["firmware"], f"build {info['build']}" if info["build"] else None])),
-               name=info["hostname"], web=info["web"], qnap=info)
-        log(f"QNAP : {info['model']} « {info['hostname'] or '?'} » en {ip}, QTS {info['firmware'] or '?'}", "ok")
+        if not d or not d["ip"]:
+            return
+        ip, mac, announced, prev = d["ip"], d["mac"], d.get("web"), dict(d.get("qnap") or {})
+    info = fv.qnap_probe(ip, first=announced)
+    if not info:
+        return
+    fields = {"vendor": "QNAP", "qnap": dict(prev, xml=info)}
+    if info.get("https_port"):
+        fields["web"] = f"https://{ip}:{info['https_port']}/"
+    elif not announced:
+        fields["web"] = info.get("web")
+    if info.get("http_port"):
+        fields["web_http"] = f"http://{ip}:{info['http_port']}/"
+    if info.get("model"):
+        fields["model"] = info["model"]
+    if info.get("firmware"):
+        fields["firmware"] = " ".join(filter(None, [info["firmware"], f"build {info['build']}" if info.get("build") else None]))
+    if info.get("hostname"):
+        fields["name"] = info["hostname"]
+    d = upsert(mac=mac, ip=ip, source="QNAP", **fields)
+    log(f"QNAP : {d.get('model') or 'NAS'} « {d.get('name') or '?'} » en {ip} · {d.get('web') or '?'}"
+        f"{' · ' + d['web_http'] if d.get('web_http') else ''}", "ok")
 
 
 # ─────────────────── Comptes : Tuya cloud, contrôleur UniFi ───────────────────
@@ -1952,6 +1968,13 @@ def parse_mdns(msg):
     return out
 
 
+def http_from_mdns(ip, ports, txt):
+    """Accès HTTP annoncé : QNAP = port du service _qdiscover (webAccessPort), sinon _http."""
+    port = ports.get("_qdiscover._tcp") if txt.get("_qdiscover._tcp") or "_qdiscover._tcp" in ports else None
+    port = port or ports.get("_http._tcp")
+    return f"http://{ip}:{port}/" if port else None
+
+
 def web_from_mdns(ip, ports, txt):
     """Adresse web annoncée : QNAP (_qdiscover : accessType/accessPort), sinon _https/_http."""
     q = txt.get("_qdiscover._tcp") or {}
@@ -2020,6 +2043,9 @@ def discover_mdns(iface, wait=3.0):
         web = web_from_mdns(ip, e["ports"], e["txt"])
         if web:
             extra["web"] = web
+        web_http = http_from_mdns(ip, e["ports"], e["txt"])
+        if web_http:
+            extra["web_http"] = web_http
         q = e["txt"].get("_qdiscover._tcp") or {}
         if q:  # annonce QNAP (celle qu'utilise QNAP Finder)
             extra.update(vendor="QNAP", qnap={"mdns": q},
@@ -2967,6 +2993,8 @@ function displayName(d){
   if(d.kind === 'pharos') return d.model || 'PharOS';
   return d.name || d.model || d.title || (d.kind === 'other' ? (d.vendor && !d.vendor.startsWith('MAC locale') ? d.vendor : 'Équipement') : KIND_LABEL[d.kind]);
 }
+function webUrl(d){ return d.web && !d.web_local ? d.web : `https://${d.ip}/`; }
+function httpUrl(d){ return d.web_http || (d.web && d.web.startsWith('http:') ? d.web : `http://${d.ip}/`); }
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none',4500); }
 
 async function refresh(){
@@ -3085,8 +3113,8 @@ function renderDetail(){
     <div class="actions">
       ${d.ip && !d.in_range ? `<button class="primary" data-act="reach" ${busy||!S.root?'disabled':''}>Rendre joignable (alias ${esc(guessNet)}x sur ${esc(d.iface || $('iface').value)})</button>` : ''}
       ${!d.ip && d.web_local ? `<button class="primary" data-act="weblocal">Ouvrir l'interface web (via IPv6)</button><p class="hint" style="margin:0">IPv4 inconnue : l'app relaie l'interface web par IPv6. Tu y liras son IP dans Network → LAN, sans reset.</p>` : ''}
-      <button ${d.ip?'':'disabled'} data-act="web" class="${d.in_range && hasWeb ? 'primary' : ''}">Ouvrir l'interface web (https)</button>
-      <button ${d.ip?'':'disabled'} data-act="webhttp">Ouvrir en http</button>
+      <button ${d.ip?'':'disabled'} data-act="web" class="${d.in_range && hasWeb ? 'primary' : ''}" title="${esc(d.ip ? webUrl(d) : '')}">Ouvrir ${esc(d.ip ? webUrl(d) : "l'interface web")}</button>
+      <button ${d.ip?'':'disabled'} data-act="webhttp" title="${esc(d.ip ? httpUrl(d) : '')}">Ouvrir ${esc(d.ip ? httpUrl(d) : 'en http')}</button>
       <button ${d.ip||d.ipv6?'':'disabled'} data-act="ssh">Session SSH…</button>
       <button ${(d.ip||d.ipv6)&&!busy?'':'disabled'} data-act="refresh">Ré-identifier</button>
     </div>
@@ -3131,8 +3159,8 @@ document.addEventListener('click', async e => {
   try{
     if(act === 'reach') await api('/api/reach', {id:d.id, iface:d.iface || $('iface').value, prefix:24});
     // Ouvert par le navigateur lui-même : jamais par le moteur administrateur.
-    if(act === 'web') window.open(d.web && !d.web_local ? d.web : `https://${d.ip}/`, '_blank', 'noopener');
-    if(act === 'webhttp') window.open(`http://${d.ip}/`, '_blank', 'noopener');
+    if(act === 'web') window.open(webUrl(d), '_blank', 'noopener');
+    if(act === 'webhttp') window.open(httpUrl(d), '_blank', 'noopener');
     if(act === 'weblocal') window.open(d.web_local, '_blank', 'noopener');
     if(act === 'ssh') await api('/api/ssh', {ip:d.ip || d.ipv6, user:($('sshUser')||{}).value || 'admin'});
     if(act === 'refresh') await api('/api/refresh', {id:d.id});

@@ -142,6 +142,7 @@ struct DetailView: View {
                       systemImage: "safari")
                     .frame(maxWidth: .infinity)
             }
+            .help(device.httpsURL ?? "")
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(!device.canOpenWeb)
@@ -156,7 +157,7 @@ struct DetailView: View {
                 Button { engine.openWeb(device, https: false) } label: {
                     Text("En http").frame(maxWidth: .infinity)
                 }
-                .help("Ouvre http:// (anciens firmwares)")
+                .help(device.httpURL ?? "Ouvre http://")
                 .disabled(device.ip == nil)
                 Button { engine.openSSH(device, user: sshUser) } label: {
                     Label("SSH", systemImage: "terminal").frame(maxWidth: .infinity)
@@ -169,6 +170,13 @@ struct DetailView: View {
             }
             .controlSize(.large)
             .disabled(device.sshAddress == nil)
+
+            if let s = device.httpsURL, let h = device.httpURL {
+                Text("\(s)  ·  \(h)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
 
             HStack {
                 Text("Utilisateur SSH").foregroundStyle(.secondary)
